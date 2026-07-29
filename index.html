@@ -4,7 +4,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>Centering Gauge v35</title>
+<title>Centering Gauge v36</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -307,7 +307,7 @@
 <header>
   <div class="mark"></div>
   <h1>Centering Gauge</h1>
-  <span class="ver">v35</span>
+  <span class="ver">v36</span>
   <button class="btn" id="scanBtn" data-on="0">Scan</button>
   <button class="btn" id="batchBtn" data-on="0">Batch</button>
   <button class="btn" id="collBtn" data-on="0">Collection (0)</button>
@@ -3307,13 +3307,24 @@ function findInnerBorder(flat) {
       const p1=s.horiz ? at(s.from+s.dir*(t+2), fixed) : at(fixed, s.from+s.dir*(t+2));
       g[t]=diff(p0,p1);
     }
+    // Local maxima including plateaus. A crisp or quantised edge gives a flat
+    // top, and emitting every pixel of it splits one real edge across several
+    // depth bins - which thins its ray count until a partial artifact looks
+    // just as well supported.
     const out=[];
-    for (let t=loPx+1;t<hiPx;t++) {
+    let t=loPx+1;
+    while (t<hiPx) {
       const v=g[t];
-      if (v<26 || v<g[t-1] || v<g[t+1]) continue;
-      const den=g[t-1]-2*v+g[t+1];
-      const off=Math.abs(den)>1e-6 ? Math.max(-1,Math.min(1,0.5*(g[t-1]-g[t+1])/den)) : 0;
-      out.push({ t:t+off, w:v });
+      if (v<26 || v<g[t-1]) { t++; continue; }
+      let e=t;
+      while (e+1<hiPx && g[e+1]===v) e++;
+      if (e+1<hiPx && g[e+1]>v) { t=e+1; continue; }   // still climbing
+      const c=(t+e)/2;
+      const lo=g[t-1], hi=(e+1<hiPx?g[e+1]:g[e]);
+      const den=lo-2*v+hi;
+      const off=Math.abs(den)>1e-6 ? Math.max(-1,Math.min(1,0.5*(lo-hi)/den)) : 0;
+      out.push({ t:c+off, w:v });
+      t=e+1;
     }
     return out;
   }
@@ -3338,7 +3349,7 @@ function findInnerBorder(flat) {
       map.set(k,e);
     }
     return [...map.values()]
-      .filter(e=>e.n>=8)
+      .filter(e=>e.n>=14)
       .map(e=>({ depth:e.sum/e.wsum, weight:e.wsum, n:e.n }))
       .sort((a,b)=>a.depth-b.depth);
   }
@@ -3364,21 +3375,27 @@ function findInnerBorder(flat) {
   const horizC=combos(cand.left, cand.right);
   const vertC =combos(cand.top,  cand.bottom);
 
-  // Matching sums are necessary but not sufficient: a pair of decoys can satisfy
-  // them too. The second fact settles it - every competing edge (banner, art
-  // panel, text block) lies INSIDE the frame, never outside. So among the
-  // combinations that agree, the frame is the one lying furthest out, provided
-  // its edges are real rather than noise.
+  // Matching sums are necessary but not sufficient - a pair of decoys can satisfy
+  // them too - and "take the outermost" alone is worse, because glare and sleeve
+  // edges sit outside the frame and win it.
+  //
+  // What actually defines a frame is that it runs the FULL LENGTH of the card,
+  // so nearly every ray finds it. Glare is patchy, a sleeve edge is partial, a
+  // highlight covers part of one side. Ray count separates them; gradient
+  // strength does not, and in fact favours the hard-edged artifacts.
   const valid=[];
   for (const h of horizC) for (const v of vertC) {
     if (Math.abs(h.sum-v.sum) > tolSum) continue;
-    valid.push({ h, v, w:h.w+v.w, sum:(h.sum+v.sum)/2 });
+    valid.push({ h, v,
+      rays:h.x.n+h.y.n+v.x.n+v.y.n,
+      sum:(h.sum+v.sum)/2 });
   }
 
   let pickH=null, pickV=null;
   if (valid.length) {
-    const strongest=Math.max(...valid.map(c=>c.w));
-    const credible=valid.filter(c=>c.w >= strongest*0.4);
+    const mostRays=Math.max(...valid.map(c=>c.rays));
+    // Only among combinations with comparable support does outermost decide.
+    const credible=valid.filter(c=>c.rays >= mostRays*0.8);
     const best=credible.reduce((a,b)=>b.sum<a.sum?b:a);
     pickH=best.h; pickV=best.v;
   }
