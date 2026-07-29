@@ -5,7 +5,7 @@
    this file, so this is the only thing to replace when updating.
    =========================================================================== */
 
-const VERSION = 'v39';
+const VERSION = 'v41';
 
 (function boot() {
 
@@ -177,6 +177,14 @@ const CSS = String.raw`
   .gaps { font-family:"IBM Plex Mono",monospace; font-size:12px; color:var(--ink-dim); line-height:1.8; }
   .gaps b { color:var(--ink); font-weight:500; }
 
+  .concerns { display:none; flex-direction:column; gap:6px; }
+  .concerns[data-on="1"] { display:flex; }
+  .concerns h4 { margin:0; font-size:9.5px; letter-spacing:0.12em; text-transform:uppercase;
+    color:var(--ink-dim); font-weight:600; }
+  .concerns p { margin:0; font-size:11.5px; line-height:1.45; padding-left:10px;
+    border-left:2px solid var(--warn); color:var(--ink); }
+  .concerns[data-lv="failed"] p { border-left-color:var(--fail); }
+
   /* ---------- collection ---------- */
   .collection { border-top:1px solid var(--rule); }
   .collBar { display:flex; align-items:center; gap:14px; padding:14px 18px;
@@ -282,8 +290,8 @@ const CSS = String.raw`
   .priceBox[data-none="1"] b { font-family:"Archivo",sans-serif; font-size:13px; color:var(--ink-dim); }
 
   .strip2 { margin-bottom:12px; }
-  .strip2 img { display:block; width:100%; height:auto; border:1px solid var(--rule);
-    background:var(--slab); cursor:zoom-in; }
+  .strip2 .win { overflow-x:auto; border:1px solid var(--rule); background:var(--slab); line-height:0; }
+  .strip2 img { display:block; max-width:none; cursor:zoom-in; }
   .strip2 span { display:block; font-size:10.5px; color:var(--ink-dim); line-height:1.5; margin-top:5px; }
 
   .lightbox { position:fixed; inset:0; background:rgba(10,10,9,0.94); z-index:50;
@@ -409,6 +417,7 @@ const MARKUP = String.raw`
     </div>
     <div class="verdict"><b id="ceiling">—</b><span id="ceilingNote">No measurement yet.</span></div>
     <div class="gaps" id="gaps"></div>
+    <div class="concerns" id="concerns"></div>
   </div>
 </div>
 
@@ -1846,15 +1855,16 @@ function renderCardDetail() {
       <div>
         <h3>Identification</h3>
         <div class="lookup">
-          <input id="lookInput" placeholder="card name or 092/086"
-                 value="${(r.card.number||r.card.name||'').replace(/"/g,'&quot;')}">
+          <input id="lookInput" placeholder="card name or 094/084"
+                 value="${(r.card.name?(r.card.number||r.card.name):'').replace(/"/g,'&quot;')}">
           <button id="lookGo">Find</button>
         </div>
         <p class="lookNote" id="lookNote"></p>
         <div id="lookHits"></div>
         ${r.numStrip?`<div class="strip2">
-          <img src="${r.numStrip}" alt="bottom of card" id="stripImg">
-          <span>Bottom of the card at full resolution &mdash; tap to enlarge and read the number.</span>
+          <div class="win"><img src="${r.numStrip}" alt="bottom of card" id="stripImg"></div>
+          <span>Bottom of the card at full resolution. Scroll sideways &mdash; modern cards carry the
+          number at the left, some older ones at the right. Tap to enlarge.</span>
         </div>`:''}
         ${r.market ? (r.market.none
           ? `<div class="priceBox" data-none="1">
@@ -1980,11 +1990,14 @@ function renderCardDetail() {
   if (lg) lg.onclick=runLookup;
   if (li) li.onkeydown=ev=>{ if (ev.key==='Enter') { ev.preventDefault(); runLookup(); } };
 
-  // Opening a row from the name cell should land the caret in it.
+  // Opening a row from the name cell should land the caret in it. An unnamed
+  // record goes straight to the lookup box instead: read the strip, type, Enter.
   if (state.focusField) {
     const target=fields.find(f=>f.dataset.f===state.focusField);
     if (target) { target.focus(); target.select(); }
     state.focusField=null;
+  } else if (!r.card.name && li) {
+    li.focus(); li.select();
   }
 }
 
@@ -2688,6 +2701,10 @@ function renderScan() {
 
     host.innerHTML=`<div class="scanDone">
       <div class="scanCard"><img src="${r.rec.thumb}" alt=""></div>
+      ${r.rec.numStrip?`<div class="strip2">
+        <div class="win"><img src="${r.rec.numStrip}" alt="bottom of card"></div>
+        <span>Collector number &mdash; scroll sideways if you need to.</span>
+      </div>`:''}
       <div class="scanNums" ${bad?'data-doubt="1"':''}>
         <div class="scanBig"><b>${Math.round(c.hPct)}</b><i>/</i><b>${100-Math.round(c.hPct)}</b><span>left / right</span></div>
         <div class="scanBig"><b>${Math.round(c.vPct)}</b><i>/</i><b>${100-Math.round(c.vPct)}</b><span>top / bottom</span></div>
