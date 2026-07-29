@@ -5,7 +5,7 @@
    this file, so this is the only thing to replace when updating.
    =========================================================================== */
 
-const VERSION = 'v37';
+const VERSION = 'v38';
 
 (function boot() {
 
@@ -455,7 +455,7 @@ const state = {
   sampled:{bg:null,card:null}, pickMode:null, sleeve:null, pxPerMm:null,
   cardType:'standard', aspectWarn:null, guideQuality:null, guideSource:null, letterbox:null,
   frameSkew:1, frameMm:null, guideConsensus:null, guideBacking:0,
-  view:'gauge', sortKey:'date', sortDir:'desc', openCard:null, focusField:null,
+  view:'gauge', sortKey:'date', sortDir:'desc', openCard:null, focusField:null, lastQuery:null,
   scan:{ stream:null, running:false, lastCheck:0, quality:null, shot:null, result:null, busy:false, error:null },
   batch:null, batchCalib:null,
   quad:null, corners:null, cornerRef:null, cornerPxPerMm:null, cornerNative:null,
@@ -1505,22 +1505,35 @@ function bestPrice(card) {
   return null;
 }
 
-// A bare collector number like 092/086 searches by number; anything else by name.
-function buildQuery(text) {
+// Query syntax here is fussier than the docs suggest, and a bad query returns a
+// 500 rather than a useful message. So several forms are tried in turn and the
+// narrowing happens on our side, where it cannot break anything.
+function queryForms(text) {
   const t=text.trim();
-  const m=t.match(/^(\d{1,3})\s*\/\s*(\d{1,3})$/);
-  // The number keeps its leading zeros because that is how it is printed, but
-  // printedTotal is a plain integer in the API and will not match "086".
-  if (m) return `number:"${m[1]}" set.printedTotal:${parseInt(m[2],10)}`;
-  const only=t.match(/^#?(\d{1,3})$/);
-  if (only) return `number:"${only[1]}"`;
-  return `name:"*${t.replace(/"/g,'')}*"`;
+  const num=t.match(/^#?(\d{1,4})\s*(?:\/\s*(\d{1,4}))?$/);
+
+  if (num) {
+    // Numbers are stored stripped: a card printed "086/084" is number 86.
+    const bare=String(parseInt(num[1],10));
+    return {
+      kind:'number',
+      total: num[2] ? parseInt(num[2],10) : null,
+      forms: [`number:${bare}`, `number:"${bare}"`, `number:"${num[1]}"`]
+    };
+  }
+
+  const safe=t.replace(/["\\]/g,'').trim();
+  const first=safe.split(/\s+/)[0];
+  return {
+    kind:'name',
+    total:null,
+    forms: [`name:"*${safe}*"`, `name:${first}*`, `name:"${safe}"`]
+  };
 }
 
-async function searchCards(text) {
-  const q=buildQuery(text);
-  const url=`${API_BASE}/cards?q=${encodeURIComponent(q)}&pageSize=12`
-          + `&orderBy=-set.releaseDate`;
+async function apiGet(q, pageSize) {
+  const url=`${API_BASE}/cards?q=${encodeURIComponent(q)}`
+          + `&pageSize=${pageSize}&orderBy=-set.releaseDate`;
   const headers={};
   const k=apiKey();
   if (k) headers['X-Api-Key']=k;
@@ -1529,23 +1542,62 @@ async function searchCards(text) {
   try {
     res=await fetch(url,{ headers });
   } catch(e) {
-    // A blocked cross-origin request surfaces here as a bare TypeError.
-    throw new Error('Could not reach the card database. This is usually the API '
-      + 'refusing browser requests from this page, or no connection. Nothing is wrong with your data.');
+    const err=new Error('network'); err.kind='network'; throw err;
   }
-  if (res.status===429) throw new Error('Rate limited. Add a free API key to lift the limit, or wait a minute.');
-  if (res.status===403) throw new Error('The API rejected the request (403). If you set a key, check it.');
-  if (!res.ok) throw new Error('Card database returned '+res.status+'.');
-
+  if (!res.ok) {
+    const err=new Error('http '+res.status); err.kind='http'; err.status=res.status; throw err;
+  }
   const json=await res.json();
-  return (json.data||[]).map(c=>({
-    id:c.id, name:c.name,
-    set:c.set?c.set.name:'', setId:c.set?c.set.id:'',
-    number:c.number+(c.set&&c.set.printedTotal?'/'+c.set.printedTotal:''),
-    rarity:c.rarity||'',
-    thumb:c.images?c.images.small:null,
-    price:bestPrice(c)
-  }));
+  return json.data||[];
+}
+
+const mapCard=c=>({
+  id:c.id, name:c.name,
+  set:c.set?c.set.name:'', setId:c.set?c.set.id:'',
+  printedTotal:c.set?c.set.printedTotal:null,
+  number:c.number+(c.set&&c.set.printedTotal?'/'+c.set.printedTotal:''),
+  rarity:c.rarity||'',
+  thumb:c.images?c.images.small:null,
+  price:bestPrice(c)
+});
+
+async function searchCards(text) {
+  const plan=queryForms(text);
+  let raw=null, used=null, lastErr=null;
+
+  for (const q of plan.forms) {
+    try {
+      const got=await apiGet(q, plan.kind==='number'?250:24);
+      if (got.length) { raw=got; used=q; break; }
+    } catch(e) {
+      lastErr=e;
+      if (e.kind==='network') break;          // no point trying more forms
+    }
+  }
+
+  if (!raw) {
+    if (lastErr && lastErr.kind==='network')
+      throw new Error('Could not reach the card database at all — no connection, or the API '
+        + 'is refusing browser requests from this page.');
+    if (lastErr && lastErr.status===429)
+      throw new Error('Rate limited. Add a free API key to lift the limit, or wait a minute.');
+    if (lastErr && lastErr.status>=500)
+      throw new Error('The card database rejected every form of that search (error '
+        + lastErr.status + '). Try just the card name.');
+    return [];
+  }
+
+  let hits=raw.map(mapCard);
+
+  // Narrow by the printed total here rather than in the query. A card marked
+  // "086/084" is number 86 in a set of 84 - a secret rare - and that pairing is
+  // what makes it unique.
+  if (plan.total!==null) {
+    const exact=hits.filter(h=>h.printedTotal===plan.total);
+    if (exact.length) hits=exact;
+  }
+  state.lastQuery=used;
+  return hits.slice(0,12);
 }
 
 // Writes a chosen result onto a stored record.
@@ -1840,7 +1892,8 @@ function renderCardDetail() {
     try {
       const hits=await searchCards(q);
       if (!hits.length) { setNote('Nothing matched. Try the card name, or the number as 092/086.'); return; }
-      setNote(`${hits.length} match${hits.length===1?'':'es'} — pick one to fill the fields and read its price.`);
+      setNote(`${hits.length} match${hits.length===1?'':'es'} — pick one to fill the fields and read its price.`
+        + (state.lastQuery?` <em style="color:#4a463e">${state.lastQuery}</em>`:''));
       lh.innerHTML='<div class="hits">'+hits.map((h,i)=>
         `<button class="hit" data-i="${i}">
            ${h.thumb?`<img src="${h.thumb}" alt="">`:''}
