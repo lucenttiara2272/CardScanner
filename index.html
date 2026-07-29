@@ -4,7 +4,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>Centering Gauge v32</title>
+<title>Centering Gauge v33</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -307,7 +307,7 @@
 <header>
   <div class="mark"></div>
   <h1>Centering Gauge</h1>
-  <span class="ver">v32</span>
+  <span class="ver">v33</span>
   <button class="btn" id="scanBtn" data-on="0">Scan</button>
   <button class="btn" id="batchBtn" data-on="0">Batch</button>
   <button class="btn" id="collBtn" data-on="0">Collection (0)</button>
@@ -410,7 +410,8 @@ const ctx = canvas.getContext('2d');
 const state = {
   step:1, img:null, edges:null, fits:null, scanPts:null, showScan:false,
   sampled:{bg:null,card:null}, pickMode:null, sleeve:null, pxPerMm:null,
-  cardType:'standard', aspectWarn:null, guideQuality:null, guideSource:null,
+  cardType:'standard', aspectWarn:null, guideQuality:null, guideSource:null, letterbox:null,
+  frameSkew:1, frameMm:null,
   view:'gauge', sortKey:'date', sortDir:'desc', openCard:null, focusField:null,
   scan:{ stream:null, running:false, lastCheck:0, quality:null, shot:null, result:null, busy:false, error:null },
   batch:null, batchCalib:null,
@@ -422,6 +423,86 @@ const state = {
   zoomPct:null, flat:null, guides:null, side:'front',
   drag:null, pointer:null, scale:1
 };
+
+// ===========================================================================
+// LETTERBOX
+//
+// A phone used as a webcam, a screen recording, or a stream in the wrong
+// aspect all arrive with synthetic bars down the sides or across the top. Those
+// bars have a hard, straight, perfectly persistent edge - so the card detector
+// locks onto them instead of the card and reports a beautifully tight fit on
+// completely the wrong rectangle.
+//
+// They are safely distinguishable: synthetic fill is uniform to within a couple
+// of levels, while any photographed surface, however dark, carries sensor noise.
+// ===========================================================================
+
+const BAR_UNIFORM = 12;   // max spread within a row before it is not a bar
+const BAR_MATCH   = 26;   // how far a row may drift from the outermost one
+const BAR_MAX     = 0.42; // never eat more than this fraction of a side
+
+function stripLetterbox(img) {
+  const W=img.width||img.naturalWidth, H=img.height||img.naturalHeight;
+  if (!W||!H) return { img, cropped:false };
+
+  const s=Math.min(1, 420/Math.max(W,H));
+  const w=Math.max(8,Math.round(W*s)), h=Math.max(8,Math.round(H*s));
+  const c=document.createElement('canvas');
+  c.width=w; c.height=h;
+  const cc=c.getContext('2d',{willReadFrequently:true});
+  cc.drawImage(img,0,0,w,h);
+  const d=cc.getImageData(0,0,w,h).data;
+  const at=(x,y)=>{ const i=((y|0)*w+(x|0))*4; return [d[i],d[i+1],d[i+2]]; };
+
+  // Summarise a row or column: mean colour and how much it varies.
+  function line(fixed, horiz) {
+    const n=horiz?w:h, step=Math.max(1,Math.round(n/60));
+    let r=0,g=0,b=0,k=0, lo=999, hi=-1;
+    for (let i=0;i<n;i+=step) {
+      const p=horiz?at(i,fixed):at(fixed,i);
+      r+=p[0]; g+=p[1]; b+=p[2]; k++;
+      const L=0.299*p[0]+0.587*p[1]+0.114*p[2];
+      if (L<lo) lo=L; if (L>hi) hi=L;
+    }
+    return { r:r/k, g:g/k, b:b/k, spread:hi-lo };
+  }
+
+  const dist=(a,b)=>Math.abs(a.r-b.r)+Math.abs(a.g-b.g)+Math.abs(a.b-b.b);
+
+  // Walk inward while rows stay uniform and match the outermost one.
+  function depth(horiz, fromStart) {
+    const n=horiz?h:w;
+    const first=line(fromStart?0:n-1, horiz);
+    if (first.spread>BAR_UNIFORM) return 0;
+    let k=0;
+    const lim=Math.floor(n*BAR_MAX);
+    for (let i=1;i<lim;i++) {
+      const L=line(fromStart?i:n-1-i, horiz);
+      if (L.spread>BAR_UNIFORM || dist(L,first)>BAR_MATCH) break;
+      k=i;
+    }
+    return k+1;
+  }
+
+  const top=depth(true,true), bottom=depth(true,false);
+  const left=depth(false,true), right=depth(false,false);
+
+  // Ignore a single soft edge row; only real bars are worth cutting.
+  const minBar=Math.max(3, Math.round(Math.min(w,h)*0.015));
+  const t=top>minBar?top:0, b2=bottom>minBar?bottom:0;
+  const l=left>minBar?left:0, r2=right>minBar?right:0;
+  if (!t&&!b2&&!l&&!r2) return { img, cropped:false };
+
+  const inv=1/s;
+  const rx=Math.round(l*inv), ry=Math.round(t*inv);
+  const rw=Math.round((w-l-r2)*inv), rh=Math.round((h-t-b2)*inv);
+  if (rw<W*0.2||rh<H*0.2) return { img, cropped:false };
+
+  const out=document.createElement('canvas');
+  out.width=rw; out.height=rh;
+  out.getContext('2d').drawImage(img, rx, ry, rw, rh, 0, 0, rw, rh);
+  return { img:out, cropped:true, bars:{ top:t*inv, bottom:b2*inv, left:l*inv, right:r2*inv } };
+}
 
 // ===========================================================================
 // DETECTION
@@ -1675,7 +1756,9 @@ async function processOne(file, side) {
   const saved=snapshotState();
   try {
     state.side=side||'front';
-    state.img=img;
+    const lb=stripLetterbox(img);
+    state.letterbox=lb.cropped?lb.bars:null;
+    state.img=img=lb.img;
     state.flat=null; state.quad=null; state.corners=null; state.edgeScan=null;
     state.edgeMark=null; state.borderRef=null;
     // A batch shares one surface and one light, so colours sampled once apply
@@ -2166,6 +2249,9 @@ async function captureScan() {
 
 // The captured canvas goes through exactly the same pipeline as a loaded file.
 function runScanPipeline(canvas) {
+  const lb=stripLetterbox(canvas);
+  state.letterbox=lb.cropped?lb.bars:null;
+  canvas=lb.img;
   state.img=canvas;
   state.flat=null; state.quad=null; state.corners=null; state.edgeScan=null;
   state.borderRef=null; state.sampled={bg:null,card:null};
@@ -2364,10 +2450,12 @@ function openFile(file) {
   {
   const img=new Image();
   img.onload=()=>{
-    state.img=img; state.flat=null; state.guides=null;
+    const lb=stripLetterbox(img);
+    state.letterbox=lb.cropped?lb.bars:null;
+    state.img=lb.img; state.flat=null; state.guides=null;
     state.fits=null; state.scanPts=null; state.sleeve=null; state.margins=null;
     state.sampled={bg:null,card:null}; state.pickMode=null;
-    const W=img.width,H=img.height;
+    const W=state.img.width,H=state.img.height;
     state.edges={
       top:[{x:W*0.22,y:H*0.10},{x:W*0.78,y:H*0.10}],
       bottom:[{x:W*0.22,y:H*0.90},{x:W*0.78,y:H*0.90}],
@@ -2426,6 +2514,10 @@ function runDetect() {
     const weak=EDGE_KEYS.filter(k=>!res.fits[k]||res.fits[k].kept<22||res.fits[k].rms>1.2);
     if (res.tightest!==null && res.tightest<2) {
       setFlag('warn',`The tightest margin is only ${res.tightest.toFixed(1)}% of the frame. The background was still found, but around 10% on every side reads much more cleanly.`);
+    } else if (state.letterbox) {
+      const b=state.letterbox;
+      const parts=Object.entries(b).filter(([,v])=>v>0).map(([k,v])=>`${k} ${Math.round(v)}px`);
+      setFlag('warn',`Blank bars trimmed from the image (${parts.join(', ')}) — they have a hard straight edge the detector would otherwise mistake for the card.`);
     } else if (state.aspectWarn) {
       setFlag('warn', state.aspectWarn);
     } else if (res.pxPerMm!==null && res.pxPerMm<8) {
@@ -3571,6 +3663,11 @@ function buildScale() {
 function measure() {
   const f=state.flat,g=state.guides; if (!f||!g) return;
   const left=g.left,right=f.w-g.right,top=g.top,bottom=f.h-g.bottom;
+  // Same evenness test the batch and scan apply: a card's frame is uniform, so
+  // left+right must roughly equal top+bottom whatever the centring.
+  const lrMm=(left+right)*f.mmPerPx, tbMm=(top+bottom)*f.mmPerPx;
+  state.frameSkew = (lrMm>0.2&&tbMm>0.2) ? Math.max(lrMm,tbMm)/Math.min(lrMm,tbMm) : 1;
+  state.frameMm = { lr:lrMm, tb:tbMm };
   const hPct=ratio(left,right), vPct=ratio(top,bottom);
   show('hRatio',hPct,left<=right?'left tight':'right tight');
   show('vRatio',vPct,top<=bottom?'top tight':'bottom tight');
@@ -3599,13 +3696,27 @@ function updateVerdict(worst,valid) {
     if (needle) needle.style.left='-99px';
     return;
   }
+  // A grade computed from guides that cannot both be right is worse than none.
+  if (state.frameSkew>1.5) {
+    el.textContent='\u2014';
+    el.style.color='var(--fail)';
+    note.innerHTML=`Border widths disagree &mdash; <b>${state.frameMm.lr.toFixed(1)} mm</b> across
+      against <b>${state.frameMm.tb.toFixed(1)} mm</b> down. A card's frame is even, so one pair
+      of guides is in the wrong place. Fix them before reading the ratio.`;
+    if (needle) needle.style.left='-99px';
+    return;
+  }
+
   const hit=tol.findIndex(t=>worst<=t.max);
   const grade=hit===-1?'<5':tol[hit].g;
   el.textContent=grade;
   el.style.color=hit===-1?'var(--fail)':BAND_COLOR[hit];
-  note.innerHTML=hit===0
+  note.innerHTML=(hit===0
     ? `Centering clears the ${state.side} tolerance for a 10.`
-    : `Centering alone caps this at ${grade} on the ${state.side}.`;
+    : `Centering alone caps this at ${grade} on the ${state.side}.`)
+    + (state.frameSkew>1.2
+      ? ` <b>Borders differ ${state.frameMm.lr.toFixed(1)} vs ${state.frameMm.tb.toFixed(1)} mm</b> — check the guides.`
+      : '');
   if (needle) {
     let pos=100;
     if (hit!==-1) {
