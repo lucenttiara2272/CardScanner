@@ -4,7 +4,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>Centering Gauge v33</title>
+<title>Centering Gauge v34</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -307,7 +307,7 @@
 <header>
   <div class="mark"></div>
   <h1>Centering Gauge</h1>
-  <span class="ver">v33</span>
+  <span class="ver">v34</span>
   <button class="btn" id="scanBtn" data-on="0">Scan</button>
   <button class="btn" id="batchBtn" data-on="0">Batch</button>
   <button class="btn" id="collBtn" data-on="0">Collection (0)</button>
@@ -411,7 +411,7 @@ const state = {
   step:1, img:null, edges:null, fits:null, scanPts:null, showScan:false,
   sampled:{bg:null,card:null}, pickMode:null, sleeve:null, pxPerMm:null,
   cardType:'standard', aspectWarn:null, guideQuality:null, guideSource:null, letterbox:null,
-  frameSkew:1, frameMm:null,
+  frameSkew:1, frameMm:null, guideConsensus:null, guideBacking:0,
   view:'gauge', sortKey:'date', sortDir:'desc', openCard:null, focusField:null,
   scan:{ stream:null, running:false, lastCheck:0, quality:null, shot:null, result:null, busy:false, error:null },
   batch:null, batchCalib:null,
@@ -2673,8 +2673,14 @@ function renderGuideNote() {
     ? ' Dashed lines were not measured directly — check those before trusting the numbers.'
     : '';
 
+  // How many sides agreed on one frame width. A card's frame is uniform, so
+  // four is what a correct read looks like whatever the card type.
+  const agree = state.guideConsensus
+    ? ` <b>${state.guideBacking} of 4</b> sides agreed on a ${state.guideConsensus.toFixed(2)} mm frame.`
+    : '';
+
   el.innerHTML = bits.length
-    ? bits.join('. ')+'.'+tail
+    ? bits.join('. ')+'.'+agree+tail
     : `<b>No inner border found</b> — the frame and artwork are too close in tone on every side. Place all four guides by hand.`;
 }
 
@@ -2841,6 +2847,8 @@ async function doStraighten() {
   const inner=findInnerBorder(flat);
   state.guideQuality=inner.quality;
   state.guideSource=inner.source;
+  state.guideConsensus=inner.consensus;
+  state.guideBacking=inner.backing;
   for (const k of EDGE_KEYS) {
     if (inner.guides[k]!==null) state.guides[k]=inner.guides[k];
   }
@@ -3274,10 +3282,6 @@ function findInnerBorder(flat) {
   const W=flat.w, H=flat.h;
 
   const at=(x,y)=>{ const i=((y|0)*W+(x|0))*4; return [img[i],img[i+1],img[i+2]]; };
-
-  // Colour distance, not brightness. Pale artwork can match a silver border in
-  // luminance while still differing in hue, and on full art that is often the
-  // only thing separating frame from illustration.
   const diff=(a,b)=>Math.abs(a[0]-b[0])+Math.abs(a[1]-b[1])+Math.abs(a[2]-b[2]);
 
   const sides={
@@ -3288,94 +3292,127 @@ function findInnerBorder(flat) {
   };
 
   const SCANS=60;
+  const loPx=Math.max(2, Math.round(GUIDE_MIN_MM*pxPerMm));
 
-  function ray(fixed, s, loPx, hiPx, thresh) {
-    let bestT=-1, bestV=0; const g=[];
+  // Every significant transition along one ray, not just the strongest. On a
+  // Supporter or a Tool the frame is often NOT the strongest thing near the
+  // edge - the art panel or the banner beats it - so taking only the maximum
+  // throws away the answer before anything can vote on it.
+  function peaks(fixed, s, hiPx) {
+    const g=[];
     for (let t=loPx;t<=hiPx;t++) {
       const p0=s.horiz ? at(s.from+s.dir*(t-2), fixed) : at(fixed, s.from+s.dir*(t-2));
       const p1=s.horiz ? at(s.from+s.dir*(t+2), fixed) : at(fixed, s.from+s.dir*(t+2));
-      const v=diff(p0,p1);
-      g[t]=v;
-      if (v>bestV) { bestV=v; bestT=t; }
+      g[t]=diff(p0,p1);
     }
-    if (bestT<0 || bestV<thresh) return null;
-    const g0=g[bestT-1], g1=g[bestT], g2=g[bestT+1];
-    let t=bestT;
-    if (g0!==undefined&&g1!==undefined&&g2!==undefined) {
-      const den=g0-2*g1+g2;
-      if (Math.abs(den)>1e-6) t+=Math.max(-1,Math.min(1,0.5*(g0-g2)/den));
+    const out=[];
+    for (let t=loPx+1;t<hiPx;t++) {
+      const v=g[t];
+      if (v<26 || v<g[t-1] || v<g[t+1]) continue;
+      const den=g[t-1]-2*v+g[t+1];
+      const off=Math.abs(den)>1e-6 ? Math.max(-1,Math.min(1,0.5*(g[t-1]-g[t+1])/den)) : 0;
+      out.push({ t:t+off, w:v });
     }
-    return t;
+    return out;
   }
 
-  // Scans one side and returns the border width in pixels from the card edge.
-  function scanSide(s, loMm, hiMm, thresh) {
-    const loPx=Math.max(2,Math.round(loMm*pxPerMm));
-    const hiPx=Math.min(s.size-3, Math.round(hiMm*pxPerMm));
-    if (hiPx<=loPx+2) return { value:null, found:0, spreadMm:null };
-
-    const hits=[];
+  // Gather every ray's peaks into depth clusters for one side.
+  function clusters(s) {
+    const hiPx=Math.min(s.size-3, Math.round(GUIDE_MAX_MM*pxPerMm));
+    if (hiPx<=loPx+2) return [];
+    const all=[];
     for (let i=0;i<SCANS;i++) {
       const u=Math.round(s.span*(0.15+0.70*i/(SCANS-1)));
-      const t=ray(u,s,loPx,hiPx,thresh);
-      if (t!==null) hits.push(t);
+      for (const p of peaks(u,s,hiPx)) all.push(p);
     }
-    if (hits.length<8) return { value:null, found:hits.length, spreadMm:null };
+    if (!all.length) return [];
 
-    // Median, keep the rays that agreed, median again. A wandering edge in the
-    // artwork cannot drag this the way a mean would.
-    const m0=median(hits);
-    const keep=hits.filter(t=>Math.abs(t-m0)<=Math.max(2,pxPerMm*0.35));
-    const m=keep.length>=6?median(keep):m0;
-    const dev=median(keep.map(t=>Math.abs(t-m)))||0;
-    return { value:m, found:keep.length, spreadMm:dev*flat.mmPerPx };
+    const bin=Math.max(1, pxPerMm*0.22);
+    const map=new Map();
+    for (const p of all) {
+      const k=Math.round(p.t/bin);
+      const e=map.get(k)||{ sum:0, wsum:0, n:0 };
+      e.sum+=p.t*p.w; e.wsum+=p.w; e.n++;
+      map.set(k,e);
+    }
+    return [...map.values()]
+      .filter(e=>e.n>=8)
+      .map(e=>({ depth:e.sum/e.wsum, weight:e.wsum, n:e.n }))
+      .sort((a,b)=>a.depth-b.depth);
+  }
+
+  const cand={};
+  for (const [key,s] of Object.entries(sides)) cand[key]=clusters(s);
+
+  // Vote for the border width all four sides can live with. However off-centre
+  // a card is, its frame is one uniform width, so the true edge draws support
+  // from every side while a layout feature draws support from one.
+  const tol=Math.max(2, pxPerMm*1.1);
+  let bestW=null, bestScore=0, bestBacking=0;
+  const pool=[];
+  for (const k of EDGE_KEYS) for (const c of cand[k]) pool.push(c.depth);
+
+  for (const w of pool) {
+    let score=0, backing=0;
+    for (const k of EDGE_KEYS) {
+      let best=0;
+      for (const c of cand[k]) if (Math.abs(c.depth-w)<=tol && c.weight>best) best=c.weight;
+      if (best>0) { score+=best; backing++; }
+    }
+    if (backing>bestBacking || (backing===bestBacking && score>bestScore)) {
+      bestBacking=backing; bestScore=score; bestW=w;
+    }
   }
 
   const width={}, quality={}, source={};
 
-  // ---- pass one: wide search, strict threshold ----
-  for (const [key,s] of Object.entries(sides)) {
-    const r=scanSide(s, GUIDE_MIN_MM, GUIDE_MAX_MM, 30);
-    const ok = r.value!==null && r.found>=20 && r.spreadMm<0.25;
-    width[key]= ok ? r.value : null;
-    quality[key]=r;
-    source[key]= ok ? 'measured' : null;
+  for (const key of EDGE_KEYS) {
+    const s=sides[key];
+    let pick=null;
+
+    if (bestW!==null && bestBacking>=2) {
+      let best=0;
+      for (const c of cand[key]) {
+        if (Math.abs(c.depth-bestW)<=tol && c.weight>best) { best=c.weight; pick=c; }
+      }
+    }
+    // Nothing agreed with the consensus: fall back to this side's own strongest.
+    let how = pick ? 'measured' : null;
+    if (!pick && cand[key].length) {
+      pick=cand[key].reduce((a,b)=>b.weight>a.weight?b:a);
+      how='guided';
+    }
+
+    if (pick) {
+      width[key]=pick.depth;
+      quality[key]={ found:pick.n, total:SCANS, spreadMm:0 };
+      source[key]=how;
+    } else {
+      width[key]=null; quality[key]={ found:0, total:SCANS, spreadMm:null }; source[key]=null;
+    }
   }
 
-  // ---- pass two: the sides that worked tell the others where to look ----
+  // Mirror anything still missing from the opposite side.
   const solved=EDGE_KEYS.filter(k=>width[k]!==null);
   if (solved.length) {
     const opposite={left:'right',right:'left',top:'bottom',bottom:'top'};
     const typical=median(solved.map(k=>width[k]));
-
     for (const key of EDGE_KEYS) {
       if (width[key]!==null) continue;
       const opp=width[opposite[key]];
-      const guess=(opp!==null?opp:typical)*flat.mmPerPx;
-
-      // A narrow window around the expected width, with a lower bar. Less
-      // room for a feature in the artwork to win by accident.
-      const r=scanSide(sides[key], Math.max(GUIDE_MIN_MM,guess-1.0), guess+1.0, 16);
-      if (r.value!==null && r.found>=14 && r.spreadMm<0.3) {
-        width[key]=r.value; quality[key]=r; source[key]='guided';
-      } else {
-        // Nothing found even then: mirror the opposite side so the guide lands
-        // somewhere sane, and mark it as an assumption rather than a reading.
-        width[key]=(opp!==null?opp:typical);
-        quality[key]=r; source[key]='mirrored';
-      }
+      width[key]=(opp!==null&&opp!==undefined)?opp:typical;
+      source[key]='mirrored';
     }
   }
 
   const guides={};
   for (const key of EDGE_KEYS) {
     const s=sides[key];
-    guides[key]= width[key]===null ? null
-      : (s.dir===1 ? width[key] : s.size-1-width[key]);
+    guides[key]= width[key]==null ? null : (s.dir===1 ? width[key] : s.size-1-width[key]);
     if (source[key]===null) source[key]='none';
   }
 
-  return { guides, quality, source };
+  return { guides, quality, source, consensus: bestW!==null ? bestW*flat.mmPerPx : null, backing: bestBacking };
 }
 
 // ===========================================================================
