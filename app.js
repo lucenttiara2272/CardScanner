@@ -5,7 +5,7 @@
    this file, so this is the only thing to replace when updating.
    =========================================================================== */
 
-const VERSION = 'v38';
+const VERSION = 'v39';
 
 (function boot() {
 
@@ -279,6 +279,20 @@ const CSS = String.raw`
   .priceBox b { font-family:"IBM Plex Mono",monospace; font-size:22px; font-weight:600; }
   .priceBox span { display:block; font-size:10.5px; color:var(--ink-dim); line-height:1.5; margin-top:5px; }
   .priceBox em { font-style:normal; color:var(--warn); }
+  .priceBox[data-none="1"] b { font-family:"Archivo",sans-serif; font-size:13px; color:var(--ink-dim); }
+
+  .strip2 { margin-bottom:12px; }
+  .strip2 img { display:block; width:100%; height:auto; border:1px solid var(--rule);
+    background:var(--slab); cursor:zoom-in; }
+  .strip2 span { display:block; font-size:10.5px; color:var(--ink-dim); line-height:1.5; margin-top:5px; }
+
+  .lightbox { position:fixed; inset:0; background:rgba(10,10,9,0.94); z-index:50;
+    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:16px; padding:20px; }
+  .lightbox > div { max-width:100%; overflow-x:auto; border:1px solid var(--rule); background:var(--slab); }
+  .lightbox img { display:block; max-width:none; image-rendering:auto; }
+  .lightbox button { font-family:"Archivo",sans-serif; font-size:12px; font-weight:600;
+    letter-spacing:0.1em; text-transform:uppercase; background:var(--border-yel);
+    border:0; color:var(--graphite); padding:11px 22px; cursor:pointer; }
 
   /* ---------- scan (phone) ---------- */
   .scanView { border-top:1px solid var(--rule); }
@@ -1343,6 +1357,20 @@ function makeThumb(flat, w) {
   return c.toDataURL('image/jpeg',0.72);
 }
 
+// The bottom band of the card, kept at full resolution. The collector number
+// lives there - left on modern cards, right on some older ones - so the whole
+// width is taken. A few kilobytes buys a legible number after the original
+// photo is long gone, and it is exactly the crop OCR would want later.
+function makeNumberStrip(flat) {
+  const pxPerMm=1/flat.mmPerPx;
+  const bandPx=Math.round(7.5*pxPerMm);
+  const y0=Math.max(0, flat.h-bandPx);
+  const c=document.createElement('canvas');
+  c.width=flat.w; c.height=Math.min(bandPx, flat.h);
+  c.getContext('2d').drawImage(flat.canvas, 0, y0, flat.w, c.height, 0, 0, c.width, c.height);
+  return c.toDataURL('image/jpeg', 0.82);
+}
+
 // Everything measured about the card in front of you, frozen into a record.
 function buildRecord() {
   const f=state.flat, g=state.guides;
@@ -1374,7 +1402,8 @@ function buildRecord() {
       depthMm: state.edgeDepth,
       guideSource: state.guideSource?{...state.guideSource}:null
     },
-    thumb:makeThumb(f,150)
+    thumb:makeThumb(f,150),
+    numStrip:makeNumberStrip(f)
   };
 
   if (state.corners) {
@@ -1609,7 +1638,9 @@ function attachCard(recId, hit) {
   rec.card.set=hit.set;
   rec.card.number=hit.number;
   rec.card.rarity=hit.rarity;
-  rec.market = hit.price ? { ...hit.price, at:new Date().toISOString(), apiId:hit.id } : null;
+  rec.market = hit.price
+    ? { ...hit.price, at:new Date().toISOString(), apiId:hit.id }
+    : { none:true, at:new Date().toISOString(), apiId:hit.id };
   rec.apiId=hit.id;
   writeStore(st);
   renderCollection();
@@ -1620,18 +1651,30 @@ async function refreshPrice(recId) {
   const rec=st.cards.find(c=>c.id===recId);
   if (!rec||!rec.apiId) return;
   const headers={}; const k=apiKey(); if (k) headers['X-Api-Key']=k;
-  const res=await fetch(`${API_BASE}/cards/${encodeURIComponent(rec.apiId)}`,{ headers });
-  if (!res.ok) throw new Error('Lookup returned '+res.status+'.');
+  let res;
+  try {
+    res=await fetch(`${API_BASE}/cards/${encodeURIComponent(rec.apiId)}`,{ headers });
+  } catch(e) {
+    throw new Error('could not reach the database');
+  }
+  if (!res.ok) throw new Error(res.status===404
+    ? 'the database no longer lists this card id'
+    : 'the database returned '+res.status);
   const json=await res.json();
   const p=bestPrice(json.data||{});
   const st2=loadStore();
   const r2=st2.cards.find(c=>c.id===recId);
-  if (r2) { r2.market = p ? { ...p, at:new Date().toISOString(), apiId:rec.apiId } : null; writeStore(st2); }
+  if (r2) {
+    r2.market = p
+      ? { ...p, at:new Date().toISOString(), apiId:rec.apiId }
+      : { none:true, at:new Date().toISOString(), apiId:rec.apiId };
+    writeStore(st2);
+  }
   renderCollection();
 }
 
 const money=m=>{
-  if (!m) return '—';
+  if (!m || m.none) return '—';
   const sym=m.currency==='EUR'?'\u20ac':m.currency==='USD'?'$':'';
   return sym+m.value.toFixed(2);
 };
@@ -1731,15 +1774,17 @@ function renderCollection() {
     const withId=loadStore().cards.filter(c=>c.apiId);
     if (!withId.length) { b.textContent='None linked'; setTimeout(()=>renderCollection(),1800); return; }
     b.disabled=true;
-    let done=0, failed=0;
+    let done=0; const problems=[];
     for (const c of withId) {
       b.textContent=`${done+1} of ${withId.length}…`;
-      try { await refreshPrice(c.id); } catch(e) { failed++; }
+      try { await refreshPrice(c.id); }
+      catch(e) { problems.push((c.card.name||c.id)+': '+e.message); }
       done++;
       await new Promise(r=>setTimeout(r, apiKey()?120:2100));   // stay inside the free limit
     }
     renderCollection();
-    if (failed) alert(failed+' of '+withId.length+' could not be refreshed.');
+    // Say what actually went wrong - a bare count is no help at all.
+    if (problems.length) alert('Could not refresh:\n\n'+problems.join('\n'));
   };
 
   document.getElementById('expBtn').onclick=exportCards;
@@ -1807,12 +1852,22 @@ function renderCardDetail() {
         </div>
         <p class="lookNote" id="lookNote"></p>
         <div id="lookHits"></div>
-        ${r.market?`<div class="priceBox">
-          <b>${money(r.market)}</b>
-          <span>${r.market.source}${r.market.low?', low '+money({...r.market,value:r.market.low}):''}
-            &middot; read ${r.market.at.slice(0,10)}<br>
-            <em>Raw, ungraded.</em> A graded copy sells for a different figure the API does not carry.</span>
+        ${r.numStrip?`<div class="strip2">
+          <img src="${r.numStrip}" alt="bottom of card" id="stripImg">
+          <span>Bottom of the card at full resolution &mdash; tap to enlarge and read the number.</span>
         </div>`:''}
+        ${r.market ? (r.market.none
+          ? `<div class="priceBox" data-none="1">
+               <b>No price published</b>
+               <span>The database has this card but no Cardmarket or TCGplayer figure yet &mdash;
+               usual for a set this new. Checked ${r.market.at.slice(0,10)}; try again in a few weeks.</span>
+             </div>`
+          : `<div class="priceBox">
+               <b>${money(r.market)}</b>
+               <span>${r.market.source}${r.market.low?', low '+money({...r.market,value:r.market.low}):''}
+                 &middot; read ${r.market.at.slice(0,10)}<br>
+                 <em>Raw, ungraded.</em> A graded copy sells for a different figure the API does not carry.</span>
+             </div>`) : ''}
         <label>Name <input data-f="name" value="${r.card.name||''}" placeholder="card name"></label>
         <label>Set <input data-f="set" value="${r.card.set||''}" placeholder="set code"></label>
         <label>Number <input data-f="number" value="${r.card.number||''}" placeholder="collector no."></label>
@@ -1908,6 +1963,18 @@ function renderCardDetail() {
     } finally {
       lg.disabled=false; lg.textContent='Find';
     }
+  };
+
+  const si=document.getElementById('stripImg');
+  if (si) si.onclick=()=>{
+    // Native resolution, scrollable sideways - downscaling it to fit would
+    // defeat the point.
+    const box=document.createElement('div');
+    box.className='lightbox';
+    box.innerHTML=`<div><img src="${r.numStrip}" alt=""></div><button>Close</button>`;
+    box.querySelector('button').onclick=()=>box.remove();
+    box.onclick=ev=>{ if (ev.target===box) box.remove(); };
+    document.body.appendChild(box);
   };
 
   if (lg) lg.onclick=runLookup;
