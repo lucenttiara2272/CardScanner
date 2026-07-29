@@ -4,7 +4,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>Centering Gauge v30</title>
+<title>Centering Gauge v31</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -288,6 +288,8 @@
   .scanMm em { font-style:normal; font-size:10.5px; }
   .scanWarn { font-size:11.5px; line-height:1.5; color:var(--warn); margin:0;
     border-left:2px solid var(--warn); padding-left:10px; }
+  .scanNums[data-doubt="1"] .scanBig b { color:var(--ink-dim); }
+  .scanNums[data-doubt="1"] .scanWarn { color:var(--fail); border-left-color:var(--fail); }
 
   @media (max-width:600px) {
     header { padding:10px 12px; gap:8px; }
@@ -305,7 +307,7 @@
 <header>
   <div class="mark"></div>
   <h1>Centering Gauge</h1>
-  <span class="ver">v30</span>
+  <span class="ver">v31</span>
   <button class="btn" id="scanBtn" data-on="0">Scan</button>
   <button class="btn" id="batchBtn" data-on="0">Batch</button>
   <button class="btn" id="collBtn" data-on="0">Collection (0)</button>
@@ -1615,6 +1617,18 @@ function assessCard(det, quad, guideSource, rec) {
   const assumed=EDGE_KEYS.filter(k=>guideSource[k]==='mirrored'||guideSource[k]==='none');
   if (assumed.length) flag('check','inner border assumed on '+assumed.join(', '));
 
+  // The frame of a card is the same width all round: however off-centre it sits,
+  // left+right must total about the same as top+bottom. When they do not, a
+  // guide has landed somewhere it should not - and no amount of care about the
+  // percentages helps, because they are computed from the wrong lines.
+  const c0=rec.centering;
+  const lr=c0.leftMm+c0.rightMm, tb=c0.topMm+c0.bottomMm;
+  if (lr>0.2 && tb>0.2) {
+    const r=Math.max(lr,tb)/Math.min(lr,tb);
+    if (r>1.8) flag('failed',`border widths disagree badly — ${lr.toFixed(1)} mm across against ${tb.toFixed(1)} mm down. A card's frame is even, so a guide is in the wrong place`);
+    else if (r>1.35) flag('check',`border widths differ — ${lr.toFixed(1)} mm across against ${tb.toFixed(1)} mm down; worth checking the guides`);
+  }
+
   // A verdict sitting on a threshold is inside the noise, whatever the number says.
   const tol=TOLERANCE[rec.side];
   const w=rec.centering.worst;
@@ -2140,6 +2154,12 @@ function runScanPipeline(canvas) {
   const det=detectEdges(canvas);
   if (!det.edges) { state.scan.busy=false; state.scan.result={ ok:false, why:'Could not find the card. Try a plainer surface.' }; renderScan(); return; }
   state.edges=det.edges;
+  // Carry the diagnostics across, or Details shows an empty gauge.
+  state.fits=det.fits;
+  state.scanPts=det.scanPts;
+  state.pxPerMm=det.pxPerMm;
+  state.sleeve=det.sleeve;
+  refreshAspect();
 
   const quad=cornersFromEdges(det.edges);
   const flat=quad&&straighten(canvas,quad);
@@ -2181,23 +2201,36 @@ function renderScan() {
     }
     const c=r.rec.centering;
     const lv=r.level;
+    const bad=lv==='failed';
+
+    // A confident number on top of a failed measurement is worse than no
+    // number, so when the reading cannot be trusted it is withheld and the
+    // reason takes its place.
+    const verdictBlock = bad
+      ? `<div class="scanCeil" data-lv="failed">
+           <b>&mdash;</b>
+           <span>This reading cannot be trusted. Open <b>Details</b> and set the guides by hand,
+           or scan again.</span>
+         </div>`
+      : `<div class="scanCeil" data-lv="${lv}">
+           <b>${c.ceiling??'<5'}</b>
+           <span>${c.ceiling===10?'centering clears a 10':'centering caps this at '+(c.ceiling??'under 5')}</span>
+         </div>`;
+
     host.innerHTML=`<div class="scanDone">
       <div class="scanCard"><img src="${r.rec.thumb}" alt=""></div>
-      <div class="scanNums">
+      <div class="scanNums" ${bad?'data-doubt="1"':''}>
         <div class="scanBig"><b>${Math.round(c.hPct)}</b><i>/</i><b>${100-Math.round(c.hPct)}</b><span>left / right</span></div>
         <div class="scanBig"><b>${Math.round(c.vPct)}</b><i>/</i><b>${100-Math.round(c.vPct)}</b><span>top / bottom</span></div>
-        <div class="scanCeil" data-lv="${lv}">
-          <b>${c.ceiling??'<5'}</b>
-          <span>${c.ceiling===10?'centering clears a 10':'centering caps this at '+(c.ceiling??'under 5')}</span>
-        </div>
+        ${verdictBlock}
         <p class="scanMm">L ${c.leftMm.toFixed(2)} &nbsp; R ${c.rightMm.toFixed(2)} mm<br>
            T ${c.topMm.toFixed(2)} &nbsp; B ${c.bottomMm.toFixed(2)} mm<br>
            <em>${r.pxPerMm?r.pxPerMm.toFixed(1)+' px/mm':''}</em></p>
         ${r.reasons.length?`<p class="scanWarn">${r.reasons.join(' · ')}</p>`:''}
       </div>
       <div class="scanActions">
-        <button class="btn" data-primary id="scanSave">Save</button>
-        <button class="btn" id="scanAgain">Scan again</button>
+        <button class="btn" ${bad?'':'data-primary'} id="scanSave">${bad?'Save anyway':'Save'}</button>
+        <button class="btn" ${bad?'data-primary':''} id="scanAgain">Scan again</button>
         <button class="btn" id="scanDetail">Details</button>
       </div>
     </div>`;
