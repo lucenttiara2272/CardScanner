@@ -4,7 +4,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>Centering Gauge v34</title>
+<title>Centering Gauge v35</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -307,7 +307,7 @@
 <header>
   <div class="mark"></div>
   <h1>Centering Gauge</h1>
-  <span class="ver">v34</span>
+  <span class="ver">v35</span>
   <button class="btn" id="scanBtn" data-on="0">Scan</button>
   <button class="btn" id="batchBtn" data-on="0">Batch</button>
   <button class="btn" id="collBtn" data-on="0">Collection (0)</button>
@@ -2675,8 +2675,10 @@ function renderGuideNote() {
 
   // How many sides agreed on one frame width. A card's frame is uniform, so
   // four is what a correct read looks like whatever the card type.
-  const agree = state.guideConsensus
-    ? ` <b>${state.guideBacking} of 4</b> sides agreed on a ${state.guideConsensus.toFixed(2)} mm frame.`
+  // The claim only describes what detection found, so it is dropped as soon as
+  // any guide is yours.
+  const agree = (state.guideConsensus && !by.edited.length)
+    ? ` Detection settled on a <b>${state.guideConsensus.toFixed(2)} mm</b> frame, with left+right and top+bottom agreeing.`
     : '';
 
   el.innerHTML = bits.length
@@ -3344,40 +3346,57 @@ function findInnerBorder(flat) {
   const cand={};
   for (const [key,s] of Object.entries(sides)) cand[key]=clusters(s);
 
-  // Vote for the border width all four sides can live with. However off-centre
-  // a card is, its frame is one uniform width, so the true edge draws support
-  // from every side while a layout feature draws support from one.
-  const tol=Math.max(2, pxPerMm*1.1);
-  let bestW=null, bestScore=0, bestBacking=0;
-  const pool=[];
-  for (const k of EDGE_KEYS) for (const c of cand[k]) pool.push(c.depth);
+  // Vote over PAIRS, not single sides. Individual borders genuinely differ when
+  // a card is off-centre - that is what centring means - so agreeing on one
+  // width needs a tolerance so wide that everything agrees with everything.
+  // What cannot change is the SUM: left+right and top+bottom both equal twice
+  // the frame width, however the card sits inside it.
+  const tolSum=Math.max(3, pxPerMm*0.55);
+  const combos=(a,b)=>{
+    const out=[];
+    for (const x of a) for (const y of b) {
+      const sum=x.depth+y.depth;
+      if (sum < GUIDE_MIN_MM*2*pxPerMm) continue;
+      out.push({ x, y, sum, w:x.weight+y.weight });
+    }
+    return out;
+  };
+  const horizC=combos(cand.left, cand.right);
+  const vertC =combos(cand.top,  cand.bottom);
 
-  for (const w of pool) {
-    let score=0, backing=0;
-    for (const k of EDGE_KEYS) {
-      let best=0;
-      for (const c of cand[k]) if (Math.abs(c.depth-w)<=tol && c.weight>best) best=c.weight;
-      if (best>0) { score+=best; backing++; }
-    }
-    if (backing>bestBacking || (backing===bestBacking && score>bestScore)) {
-      bestBacking=backing; bestScore=score; bestW=w;
-    }
+  // Matching sums are necessary but not sufficient: a pair of decoys can satisfy
+  // them too. The second fact settles it - every competing edge (banner, art
+  // panel, text block) lies INSIDE the frame, never outside. So among the
+  // combinations that agree, the frame is the one lying furthest out, provided
+  // its edges are real rather than noise.
+  const valid=[];
+  for (const h of horizC) for (const v of vertC) {
+    if (Math.abs(h.sum-v.sum) > tolSum) continue;
+    valid.push({ h, v, w:h.w+v.w, sum:(h.sum+v.sum)/2 });
   }
+
+  let pickH=null, pickV=null;
+  if (valid.length) {
+    const strongest=Math.max(...valid.map(c=>c.w));
+    const credible=valid.filter(c=>c.w >= strongest*0.4);
+    const best=credible.reduce((a,b)=>b.sum<a.sum?b:a);
+    pickH=best.h; pickV=best.v;
+  }
+
+  const chosen={};
+  if (pickH && pickV) {
+    chosen.left=pickH.x; chosen.right=pickH.y;
+    chosen.top=pickV.x;  chosen.bottom=pickV.y;
+  }
+  const consensusPx=(pickH&&pickV)?(pickH.sum+pickV.sum)/4:null;
+  const backing=(pickH&&pickV)?4:0;
 
   const width={}, quality={}, source={};
 
   for (const key of EDGE_KEYS) {
-    const s=sides[key];
-    let pick=null;
-
-    if (bestW!==null && bestBacking>=2) {
-      let best=0;
-      for (const c of cand[key]) {
-        if (Math.abs(c.depth-bestW)<=tol && c.weight>best) { best=c.weight; pick=c; }
-      }
-    }
-    // Nothing agreed with the consensus: fall back to this side's own strongest.
+    let pick=chosen[key]||null;
     let how = pick ? 'measured' : null;
+    // No pairing satisfied the constraint: fall back to this side's strongest.
     if (!pick && cand[key].length) {
       pick=cand[key].reduce((a,b)=>b.weight>a.weight?b:a);
       how='guided';
@@ -3412,7 +3431,9 @@ function findInnerBorder(flat) {
     if (source[key]===null) source[key]='none';
   }
 
-  return { guides, quality, source, consensus: bestW!==null ? bestW*flat.mmPerPx : null, backing: bestBacking };
+  return { guides, quality, source,
+           consensus: consensusPx!==null ? consensusPx*flat.mmPerPx : null,
+           backing };
 }
 
 // ===========================================================================
