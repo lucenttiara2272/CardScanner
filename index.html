@@ -4,7 +4,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>Centering Gauge v31</title>
+<title>Centering Gauge v32</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -307,7 +307,7 @@
 <header>
   <div class="mark"></div>
   <h1>Centering Gauge</h1>
-  <span class="ver">v31</span>
+  <span class="ver">v32</span>
   <button class="btn" id="scanBtn" data-on="0">Scan</button>
   <button class="btn" id="batchBtn" data-on="0">Batch</button>
   <button class="btn" id="collBtn" data-on="0">Collection (0)</button>
@@ -1625,8 +1625,8 @@ function assessCard(det, quad, guideSource, rec) {
   const lr=c0.leftMm+c0.rightMm, tb=c0.topMm+c0.bottomMm;
   if (lr>0.2 && tb>0.2) {
     const r=Math.max(lr,tb)/Math.min(lr,tb);
-    if (r>1.8) flag('failed',`border widths disagree badly — ${lr.toFixed(1)} mm across against ${tb.toFixed(1)} mm down. A card's frame is even, so a guide is in the wrong place`);
-    else if (r>1.35) flag('check',`border widths differ — ${lr.toFixed(1)} mm across against ${tb.toFixed(1)} mm down; worth checking the guides`);
+    if (r>1.5) flag('failed',`border widths disagree — ${lr.toFixed(1)} mm across against ${tb.toFixed(1)} mm down. A card's frame is even, so a guide is in the wrong place`);
+    else if (r>1.2) flag('check',`border widths differ — ${lr.toFixed(1)} mm across against ${tb.toFixed(1)} mm down; worth checking the guides`);
   }
 
   // A verdict sitting on a threshold is inside the noise, whatever the number says.
@@ -1635,6 +1635,14 @@ function assessCard(det, quad, guideSource, rec) {
   let near=Infinity;
   for (const t of tol) near=Math.min(near, Math.abs(w-t.max));
   if (near<1.5) flag('check',`${near.toFixed(1)} from a grade boundary — too close to call`);
+
+  // Individually survivable, together damning. A measurement carrying three
+  // separate concerns has usually gone wrong somewhere, and a confident number
+  // under a pile of warnings is the exact failure this tool exists to avoid.
+  if (level==='check' && reasons.length>=3) {
+    return { level:'failed',
+             reasons:[...reasons, `${reasons.length} concerns at once — treat this reading as unreliable`] };
+  }
 
   return { level, reasons };
 }
@@ -1916,8 +1924,9 @@ function renderBatch() {
 // says so, rather than discovering it afterwards.
 // ===========================================================================
 
-const SCAN_TARGET_FILL = 0.62;   // card area as a fraction of frame
 const SCAN_MIN_MARGIN  = 0.05;   // smallest gap to any frame edge
+const SCAN_GOOD_PXMM   = 11;     // resolution that measures comfortably
+const SCAN_MIN_PXMM    = 8;      // below this a pixel is worth over 0.1 mm
 
 const cameraPossible = () =>
   !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) && window.isSecureContext;
@@ -1925,7 +1934,7 @@ const cameraPossible = () =>
 // A cheap read of where the card is, run on a small frame several times a
 // second. Nothing here needs sub-pixel accuracy - it only has to answer
 // "is this framed well enough to shoot".
-function quickFrame(cnv) {
+function quickFrame(cnv, nativeH) {
   const w=cnv.width, h=cnv.height;
   const d=cnv.getContext('2d',{willReadFrequently:true}).getImageData(0,0,w,h).data;
 
@@ -1975,7 +1984,12 @@ function quickFrame(cnv) {
   const want=Math.min(CARD_MM.w,CARD_MM.h)/Math.max(CARD_MM.w,CARD_MM.h);
   const skew=Math.abs(seen-want)/want;
 
-  return { found:true, fill, marginMin, skew,
+  // The card's height as a fraction of the preview, scaled up to the camera's
+  // real sensor height, gives the resolution a capture would actually get.
+  const longSide=Math.max(cw,ch)/Math.max(w,h);
+  const estPxPerMm = nativeH ? (longSide*nativeH)/CARD_MM.h : null;
+
+  return { found:true, fill, marginMin, skew, estPxPerMm,
            box:{ x:L/w, y:T/h, w:cw/w, h:ch/h },
            sep: spread };
 }
@@ -1983,12 +1997,17 @@ function quickFrame(cnv) {
 function scanVerdict(q) {
   if (!q || !q.found) return { level:'bad', text:'Card not found — plain surface, whole card in view' };
   const notes=[];
-  if (q.fill < SCAN_TARGET_FILL*0.6) notes.push('move closer');
-  else if (q.fill > 0.88) notes.push('back off slightly');
-  if (q.marginMin < SCAN_MIN_MARGIN) notes.push('leave a gap all round');
-  if (q.skew > 0.10) notes.push('hold the phone flatter');
+  let hard=false;
+
+  if (q.estPxPerMm!==null) {
+    if (q.estPxPerMm < SCAN_MIN_PXMM) { notes.push('move closer'); hard=true; }
+    else if (q.estPxPerMm < SCAN_GOOD_PXMM) notes.push('a little closer sharpens it');
+  }
+  if (q.marginMin < SCAN_MIN_MARGIN) { notes.push('leave a gap all round'); hard=true; }
+  if (q.skew > 0.10) { notes.push('hold the phone flatter'); hard=true; }
+
   if (!notes.length) return { level:'good', text:'Ready' };
-  return { level: notes.length>1?'bad':'soft', text: notes.join(' · ') };
+  return { level: hard ? 'bad' : 'soft', text: notes.join(' · ') };
 }
 
 // Status is written into the existing element. Re-rendering here would build a
@@ -2080,7 +2099,7 @@ function scanLoop(ts) {
     const sw=220, sh=Math.round(sw*v.videoHeight/v.videoWidth);
     scanWork.width=sw; scanWork.height=sh;
     scanWork.getContext('2d',{willReadFrequently:true}).drawImage(v,0,0,sw,sh);
-    state.scan.quality=quickFrame(scanWork);
+    state.scan.quality=quickFrame(scanWork, Math.max(v.videoWidth, v.videoHeight));
     paintVerdict();
   }
 
@@ -2124,10 +2143,10 @@ function paintVerdict() {
   const q=state.scan.quality, vd=scanVerdict(q);
   el.dataset.lv=vd.level;
   el.innerHTML=`<b>${vd.text}</b>`+(q&&q.found
-    ? `<span>fill ${Math.round(q.fill*100)}% &middot; margin ${Math.round(q.marginMin*100)}% &middot; skew ${Math.round(q.skew*100)}%</span>`
+    ? `<span>${q.estPxPerMm?q.estPxPerMm.toFixed(1)+' px/mm &middot; ':''}margin ${Math.round(q.marginMin*100)}% &middot; skew ${Math.round(q.skew*100)}%</span>`
     : '');
   const btn=document.getElementById('scanShot');
-  if (btn) btn.dataset.ready = vd.level==='good' ? '1':'0';
+  if (btn) btn.dataset.ready = (vd.level==='good'||vd.level==='soft') ? '1':'0';
 }
 
 async function captureScan() {
