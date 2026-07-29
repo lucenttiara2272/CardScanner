@@ -5,7 +5,7 @@
    this file, so this is the only thing to replace when updating.
    =========================================================================== */
 
-const VERSION = 'v36';
+const VERSION = 'v37';
 
 (function boot() {
 
@@ -247,6 +247,38 @@ const CSS = String.raw`
   .dGrid input:focus-visible { outline:2px solid var(--edge-cyan); outline-offset:1px; }
   .dGrid input::placeholder { color:#4a463e; font-style:italic; }
   .dGrid p em { font-style:normal; color:var(--ink-dim); font-size:10.5px; }
+
+  /* card lookup */
+  .lookup { display:flex; gap:6px; margin-bottom:12px; }
+  .lookup input { flex:1; background:var(--graphite); border:1px solid var(--rule);
+    color:var(--ink); font-family:"Archivo",sans-serif; font-size:12.5px; padding:7px 9px; }
+  .lookup input:focus-visible { outline:2px solid var(--edge-cyan); outline-offset:1px; }
+  .lookup button { font-family:"Archivo",sans-serif; font-size:11px; font-weight:600;
+    letter-spacing:0.08em; text-transform:uppercase; background:none; color:var(--ink);
+    border:1px solid var(--rule); padding:7px 12px; cursor:pointer; white-space:nowrap; }
+  .lookup button:hover { border-color:var(--ink-dim); }
+  .lookup button:disabled { opacity:0.5; cursor:default; }
+
+  .hits { display:flex; flex-direction:column; gap:1px; background:var(--rule);
+    border:1px solid var(--rule); margin-bottom:12px; max-height:280px; overflow:auto; }
+  .hit { display:flex; gap:10px; align-items:center; background:var(--graphite);
+    padding:7px 9px; cursor:pointer; text-align:left; border:0; width:100%; }
+  .hit:hover { background:var(--slab); }
+  .hit img { width:30px; height:auto; display:block; border:1px solid var(--rule); flex:none; }
+  .hit div { min-width:0; }
+  .hit b { display:block; font-size:12px; font-weight:600; color:var(--ink);
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .hit span { display:block; font-family:"IBM Plex Mono",monospace; font-size:9.5px; color:var(--ink-dim); }
+  .hit i { font-style:normal; margin-left:auto; font-family:"IBM Plex Mono",monospace;
+    font-size:11px; color:var(--pass); flex:none; }
+
+  .lookNote { font-size:11px; line-height:1.5; color:var(--ink-dim); margin:0 0 12px; }
+  .lookNote[data-err="1"] { color:var(--fail); }
+
+  .priceBox { border:1px solid var(--rule); padding:12px; margin-bottom:12px; }
+  .priceBox b { font-family:"IBM Plex Mono",monospace; font-size:22px; font-weight:600; }
+  .priceBox span { display:block; font-size:10.5px; color:var(--ink-dim); line-height:1.5; margin-top:5px; }
+  .priceBox em { font-style:normal; color:var(--warn); }
 
   /* ---------- scan (phone) ---------- */
   .scanView { border-top:1px solid var(--rule); }
@@ -1429,6 +1461,130 @@ function importCards(file) {
 }
 
 // ===========================================================================
+// CARD LOOKUP
+//
+// pokemontcg.io returns identification and prices in one response. Two things
+// to be clear about:
+//
+//   - The call happens from the browser, so it depends on the API permitting
+//     cross-origin requests. If it does not, the failure is reported plainly
+//     rather than swallowed.
+//   - Prices are for RAW, ungraded cards. Deciding whether to submit needs the
+//     gap between raw and graded value, which no free API publishes. This says
+//     what the card is worth now, not what a 10 would fetch.
+// ===========================================================================
+
+const API_BASE='https://api.pokemontcg.io/v2';
+const KEY_STORE='centeringGauge.apiKey';
+
+const apiKey=()=>{ try { return localStorage.getItem(KEY_STORE)||''; } catch(e) { return ''; } };
+const setApiKey=k=>{ try { k?localStorage.setItem(KEY_STORE,k):localStorage.removeItem(KEY_STORE); } catch(e){} };
+
+// Cardmarket first: euros, and the closer market for Europe. TCGplayer covers
+// the rest. Foil variants are checked because plenty of cards have no plain
+// printing at all.
+function bestPrice(card) {
+  const cm=card.cardmarket&&card.cardmarket.prices;
+  if (cm) {
+    const v=cm.trendPrice||cm.averageSellPrice||cm.avg7||cm.avg30;
+    if (v) return { value:v, currency:'EUR', source:'Cardmarket',
+                    updated:card.cardmarket.updatedAt||null,
+                    low:cm.lowPrice||null, url:card.cardmarket.url||null };
+  }
+  const tp=card.tcgplayer&&card.tcgplayer.prices;
+  if (tp) {
+    for (const k of ['normal','holofoil','reverseHolofoil','1stEditionHolofoil','1stEditionNormal']) {
+      const p=tp[k];
+      if (p && (p.market||p.mid)) {
+        return { value:p.market||p.mid, currency:'USD', source:'TCGplayer '+k,
+                 updated:card.tcgplayer.updatedAt||null,
+                 low:p.low||null, url:card.tcgplayer.url||null };
+      }
+    }
+  }
+  return null;
+}
+
+// A bare collector number like 092/086 searches by number; anything else by name.
+function buildQuery(text) {
+  const t=text.trim();
+  const m=t.match(/^(\d{1,3})\s*\/\s*(\d{1,3})$/);
+  // The number keeps its leading zeros because that is how it is printed, but
+  // printedTotal is a plain integer in the API and will not match "086".
+  if (m) return `number:"${m[1]}" set.printedTotal:${parseInt(m[2],10)}`;
+  const only=t.match(/^#?(\d{1,3})$/);
+  if (only) return `number:"${only[1]}"`;
+  return `name:"*${t.replace(/"/g,'')}*"`;
+}
+
+async function searchCards(text) {
+  const q=buildQuery(text);
+  const url=`${API_BASE}/cards?q=${encodeURIComponent(q)}&pageSize=12`
+          + `&orderBy=-set.releaseDate`;
+  const headers={};
+  const k=apiKey();
+  if (k) headers['X-Api-Key']=k;
+
+  let res;
+  try {
+    res=await fetch(url,{ headers });
+  } catch(e) {
+    // A blocked cross-origin request surfaces here as a bare TypeError.
+    throw new Error('Could not reach the card database. This is usually the API '
+      + 'refusing browser requests from this page, or no connection. Nothing is wrong with your data.');
+  }
+  if (res.status===429) throw new Error('Rate limited. Add a free API key to lift the limit, or wait a minute.');
+  if (res.status===403) throw new Error('The API rejected the request (403). If you set a key, check it.');
+  if (!res.ok) throw new Error('Card database returned '+res.status+'.');
+
+  const json=await res.json();
+  return (json.data||[]).map(c=>({
+    id:c.id, name:c.name,
+    set:c.set?c.set.name:'', setId:c.set?c.set.id:'',
+    number:c.number+(c.set&&c.set.printedTotal?'/'+c.set.printedTotal:''),
+    rarity:c.rarity||'',
+    thumb:c.images?c.images.small:null,
+    price:bestPrice(c)
+  }));
+}
+
+// Writes a chosen result onto a stored record.
+function attachCard(recId, hit) {
+  const st=loadStore();
+  const rec=st.cards.find(c=>c.id===recId);
+  if (!rec) return;
+  rec.card.name=hit.name;
+  rec.card.set=hit.set;
+  rec.card.number=hit.number;
+  rec.card.rarity=hit.rarity;
+  rec.market = hit.price ? { ...hit.price, at:new Date().toISOString(), apiId:hit.id } : null;
+  rec.apiId=hit.id;
+  writeStore(st);
+  renderCollection();
+}
+
+async function refreshPrice(recId) {
+  const st=loadStore();
+  const rec=st.cards.find(c=>c.id===recId);
+  if (!rec||!rec.apiId) return;
+  const headers={}; const k=apiKey(); if (k) headers['X-Api-Key']=k;
+  const res=await fetch(`${API_BASE}/cards/${encodeURIComponent(rec.apiId)}`,{ headers });
+  if (!res.ok) throw new Error('Lookup returned '+res.status+'.');
+  const json=await res.json();
+  const p=bestPrice(json.data||{});
+  const st2=loadStore();
+  const r2=st2.cards.find(c=>c.id===recId);
+  if (r2) { r2.market = p ? { ...p, at:new Date().toISOString(), apiId:rec.apiId } : null; writeStore(st2); }
+  renderCollection();
+}
+
+const money=m=>{
+  if (!m) return '—';
+  const sym=m.currency==='EUR'?'\u20ac':m.currency==='USD'?'$':'';
+  return sym+m.value.toFixed(2);
+};
+
+// ===========================================================================
 // COLLECTION VIEW
 // ===========================================================================
 
@@ -1441,6 +1597,7 @@ const COLS=[
       ? r.centering.combinedCeiling : (r.centering.ceiling??0) },
   { k:'cnr',   label:'Corners',   get:r=>worstCorner(r) },
   { k:'edg',   label:'Edges',     get:r=>worstEdge(r) },
+  { k:'val',   label:'Value',     get:r=>r.market?r.market.value:-1 },
   { k:'date',  label:'Saved',     get:r=>r.savedAt }
 ];
 
@@ -1478,6 +1635,8 @@ function renderCollection() {
       <b>${st.cards.length}</b> card${st.cards.length===1?'':'s'}
       <em>${kb} KB</em>
       <span class="collNote">${warn}</span>
+      <button class="btn" id="priceBtn">Refresh prices</button>
+      <button class="btn" id="keyBtn">${apiKey()?'API key set':'API key'}</button>
       <button class="btn" id="expBtn">Export</button>
       <button class="btn" id="impBtn">Import</button>
       <input type="file" id="impFile" accept="application/json" hidden>
@@ -1498,12 +1657,38 @@ function renderCollection() {
           <td class="mono" data-g="${cg??'x'}">${cg??'<5'}</td>
           <td class="mono">${wc===null?'—':wc.toFixed(2)}</td>
           <td class="mono">${we===null?'—':we.toFixed(2)}</td>
+          <td class="mono">${r.market?money(r.market):'—'}</td>
           <td class="mono dim">${r.savedAt.slice(0,10)}</td>
           <td><button class="mini" data-del="${r.id}">✕</button></td>
         </tr>`;
       }).join('')}</tbody>
     </table>`:'<p class="hint" style="padding:18px">Nothing saved yet. Measure a card, then use <b>Save to collection</b> on the corners or edges step.</p>'}
     <div id="cardDetail"></div>`;
+
+  document.getElementById('keyBtn').onclick=()=>{
+    const cur=apiKey();
+    const k=prompt('Optional API key from pokemontcg.io/api. Lifts the rate limit; '
+      + 'lookups work without one. Leave blank to clear.', cur);
+    if (k===null) return;
+    setApiKey(k.trim());
+    renderCollection();
+  };
+
+  document.getElementById('priceBtn').onclick=async()=>{
+    const b=document.getElementById('priceBtn');
+    const withId=loadStore().cards.filter(c=>c.apiId);
+    if (!withId.length) { b.textContent='None linked'; setTimeout(()=>renderCollection(),1800); return; }
+    b.disabled=true;
+    let done=0, failed=0;
+    for (const c of withId) {
+      b.textContent=`${done+1} of ${withId.length}…`;
+      try { await refreshPrice(c.id); } catch(e) { failed++; }
+      done++;
+      await new Promise(r=>setTimeout(r, apiKey()?120:2100));   // stay inside the free limit
+    }
+    renderCollection();
+    if (failed) alert(failed+' of '+withId.length+' could not be refreshed.');
+  };
 
   document.getElementById('expBtn').onclick=exportCards;
   document.getElementById('impBtn').onclick=()=>document.getElementById('impFile').click();
@@ -1563,6 +1748,19 @@ function renderCardDetail() {
     <div class="dGrid">
       <div>
         <h3>Identification</h3>
+        <div class="lookup">
+          <input id="lookInput" placeholder="card name or 092/086"
+                 value="${(r.card.number||r.card.name||'').replace(/"/g,'&quot;')}">
+          <button id="lookGo">Find</button>
+        </div>
+        <p class="lookNote" id="lookNote"></p>
+        <div id="lookHits"></div>
+        ${r.market?`<div class="priceBox">
+          <b>${money(r.market)}</b>
+          <span>${r.market.source}${r.market.low?', low '+money({...r.market,value:r.market.low}):''}
+            &middot; read ${r.market.at.slice(0,10)}<br>
+            <em>Raw, ungraded.</em> A graded copy sells for a different figure the API does not carry.</span>
+        </div>`:''}
         <label>Name <input data-f="name" value="${r.card.name||''}" placeholder="card name"></label>
         <label>Set <input data-f="set" value="${r.card.set||''}" placeholder="set code"></label>
         <label>Number <input data-f="number" value="${r.card.number||''}" placeholder="collector no."></label>
@@ -1627,6 +1825,40 @@ function renderCardDetail() {
       }
     };
   });
+
+  const li=document.getElementById('lookInput');
+  const lg=document.getElementById('lookGo');
+  const ln=document.getElementById('lookNote');
+  const lh=document.getElementById('lookHits');
+
+  const setNote=(msg,err)=>{ if (ln) { ln.innerHTML=msg||''; ln.dataset.err=err?'1':'0'; } };
+
+  const runLookup=async()=>{
+    const q=(li.value||'').trim();
+    if (q.length<2) { setNote('Type at least two characters, or a collector number.'); return; }
+    lg.disabled=true; lg.textContent='…'; lh.innerHTML=''; setNote('Searching…');
+    try {
+      const hits=await searchCards(q);
+      if (!hits.length) { setNote('Nothing matched. Try the card name, or the number as 092/086.'); return; }
+      setNote(`${hits.length} match${hits.length===1?'':'es'} — pick one to fill the fields and read its price.`);
+      lh.innerHTML='<div class="hits">'+hits.map((h,i)=>
+        `<button class="hit" data-i="${i}">
+           ${h.thumb?`<img src="${h.thumb}" alt="">`:''}
+           <div><b>${h.name}</b><span>${h.set} · ${h.number}${h.rarity?' · '+h.rarity:''}</span></div>
+           <i>${h.price?money(h.price):''}</i>
+         </button>`).join('')+'</div>';
+      lh.querySelectorAll('button.hit').forEach(b=>{
+        b.onclick=()=>attachCard(r.id, hits[+b.dataset.i]);
+      });
+    } catch(e) {
+      setNote(e.message, true);
+    } finally {
+      lg.disabled=false; lg.textContent='Find';
+    }
+  };
+
+  if (lg) lg.onclick=runLookup;
+  if (li) li.onkeydown=ev=>{ if (ev.key==='Enter') { ev.preventDefault(); runLookup(); } };
 
   // Opening a row from the name cell should land the caret in it.
   if (state.focusField) {
@@ -1970,6 +2202,7 @@ function renderBatch() {
           <td class="mono" data-g="${ceil??'x'}">${r?(ceil??'<5'):'—'}</td>
           <td class="mono">${wc===null?'—':wc.toFixed(2)}</td>
           <td class="mono">${we===null?'—':we.toFixed(2)}</td>
+          <td class="mono">${r.market?money(r.market):'—'}</td>
           <td><span class="lvl" data-lv="${it.level}">${LEVEL_LABEL[it.level]}</span></td>
           <td class="acts">
             ${it.saved?`<span class="mono dim">${it.saved}</span>`
