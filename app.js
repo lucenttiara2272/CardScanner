@@ -23,6 +23,7 @@ const CSS = String.raw`
 
   header { display:flex; align-items:center; gap:14px; padding:14px 18px;
     border-bottom:1px solid var(--rule); flex-wrap:wrap; }
+  .narrow { display:none; }
   .mark { width:4px; height:26px; background:var(--border-yel); flex:none; }
   .ver { font-family:"IBM Plex Mono",monospace; font-size:11px; color:var(--ink-dim);
     border:1px solid var(--rule); padding:4px 8px; letter-spacing:0.05em; }
@@ -38,9 +39,11 @@ const CSS = String.raw`
   .btn[data-on="1"] { border-color:var(--edge-cyan); color:var(--edge-cyan); }
   .btn:disabled { opacity:0.5; cursor:default; }
 
-  .rail { display:flex; padding:0 18px; border-bottom:1px solid var(--rule); }
+  .rail { display:flex; padding:0 18px; border-bottom:1px solid var(--rule);
+    overflow-x:auto; scrollbar-width:none; -webkit-overflow-scrolling:touch; }
+  .rail::-webkit-scrollbar { display:none; }
   .rail div { display:flex; align-items:baseline; gap:9px; padding:11px 20px 11px 0;
-    margin-right:20px; font-size:12px; color:var(--ink-dim);
+    margin-right:20px; font-size:12px; color:var(--ink-dim); white-space:nowrap; flex:none;
     border-bottom:2px solid transparent; margin-bottom:-1px; }
   .rail div[data-on="1"] { color:var(--ink); border-bottom-color:var(--border-yel); }
   .rail div[data-done="1"] { border-bottom-color:var(--rule); }
@@ -173,6 +176,11 @@ const CSS = String.raw`
   .verdict { border:1px solid var(--rule); padding:14px; display:flex; align-items:baseline; gap:12px; }
   .verdict b { font-family:"IBM Plex Mono",monospace; font-size:40px; font-weight:600; line-height:1; }
   .verdict span { font-size:12px; line-height:1.4; color:var(--ink-dim); }
+
+  .concerns { display:flex; flex-direction:column; gap:6px; }
+  .concerns span { font-size:11.5px; line-height:1.45; color:var(--warn);
+    border-left:2px solid var(--warn); padding-left:9px; }
+  .concerns[data-lv="failed"] span { color:var(--fail); border-left-color:var(--fail); }
 
   .gaps { font-family:"IBM Plex Mono",monospace; font-size:12px; color:var(--ink-dim); line-height:1.8; }
   .gaps b { color:var(--ink); font-weight:500; }
@@ -346,12 +354,42 @@ const CSS = String.raw`
   .scanNums[data-doubt="1"] .scanBig b { color:var(--ink-dim); }
   .scanNums[data-doubt="1"] .scanWarn { color:var(--fail); border-left-color:var(--fail); }
 
-  @media (max-width:600px) {
-    header { padding:10px 12px; gap:8px; }
-    h1 { font-size:12px; letter-spacing:0.1em; }
+  @media (max-width:760px) {
+    /* The long words go, so four buttons fit one row instead of three. */
+    .wide { display:none; }
+    .narrow { display:inline; }
+
+    header { padding:9px 10px 0; gap:7px; row-gap:0; }
+    h1 { flex:1 0 100%; font-size:11.5px; letter-spacing:0.1em; padding-bottom:8px; }
+    .mark { display:none; }
     .ver { display:none; }
-    header .btn { padding:8px 11px; font-size:11px; letter-spacing:0.06em; }
-    .scanLive, .scanDone { padding:12px; }
+    header .btn { flex:1; min-width:0; padding:10px 6px; font-size:10.5px;
+      letter-spacing:0.04em; margin-bottom:9px; text-align:center; }
+
+    .rail { padding:0 10px; }
+    .rail div { padding:10px 14px 10px 0; margin-right:14px; font-size:11.5px; }
+
+    .stage { padding:11px; gap:11px; }
+    .panel { padding:14px; }
+    .row { gap:7px; }
+    .row .btn { flex:1 1 auto; padding:11px 10px; font-size:11px; }
+    .zoom { flex:1 1 100%; height:auto; padding:8px 11px; }
+    .zoom input[type=range] { flex:1; width:auto; }
+
+    /* Wide tables scroll rather than squashing every column to nothing. */
+    .collection { overflow-x:auto; }
+    table.coll { min-width:640px; }
+    .collBar { padding:11px 12px; gap:9px; }
+    .collBar .btn { padding:9px 11px; font-size:10.5px; }
+    .collNote { flex:1 0 100%; margin-left:0; order:9; }
+
+    .dGrid { grid-template-columns:1fr; gap:18px; padding:14px; }
+    .fits { flex-wrap:wrap; }
+    .fits div { flex:1 1 50%; }
+    .fits div:nth-child(2n) { border-left:0; }
+
+    .scanLive, .scanDone { padding:11px; }
+    .scanActions .btn { min-width:0; }
   }
 
   footer { padding:16px 18px 40px; font-size:11.5px; line-height:1.6; color:var(--ink-dim); max-width:72ch; border-top:1px solid var(--rule); }
@@ -369,15 +407,15 @@ const MARKUP = String.raw`
   <button class="btn" id="scanBtn" data-on="0">Scan</button>
   <button class="btn" id="batchBtn" data-on="0">Batch</button>
   <button class="btn" id="collBtn" data-on="0">Collection (0)</button>
-  <button class="btn" data-primary id="loadBtn">Load card photo</button>
+  <button class="btn" data-primary id="loadBtn">Load <span class="wide">card </span>photo</button>
   <input type="file" id="file" accept="image/*" hidden>
 </header>
 
 <div class="rail" id="rail">
-  <div data-step="1" data-on="1"><b>01</b> Fit the edges</div>
-  <div data-step="2"><b>02</b> Measure centering</div>
-  <div data-step="3"><b>03</b> Inspect corners</div>
-  <div data-step="4"><b>04</b> Inspect edges</div>
+  <div data-step="1" data-on="1"><b>01</b> <span class="wide">Fit the </span>Edges</div>
+  <div data-step="2"><b>02</b> <span class="wide">Measure </span>Centering</div>
+  <div data-step="3"><b>03</b> <span class="wide">Inspect </span>Corners</div>
+  <div data-step="4"><b>04</b> <span class="wide">Inspect </span>Edges</div>
 </div>
 
 <div class="work" id="work">
@@ -416,6 +454,7 @@ const MARKUP = String.raw`
       <div class="ticks" id="ticks"></div>
     </div>
     <div class="verdict"><b id="ceiling">—</b><span id="ceilingNote">No measurement yet.</span></div>
+    <div class="concerns" id="concerns"></div>
     <div class="gaps" id="gaps"></div>
     <div class="concerns" id="concerns"></div>
   </div>
@@ -478,6 +517,7 @@ const state = {
   sampled:{bg:null,card:null}, pickMode:null, sleeve:null, pxPerMm:null,
   cardType:'standard', aspectWarn:null, guideQuality:null, guideSource:null, letterbox:null,
   frameSkew:1, frameMm:null, guideConsensus:null, guideBacking:0,
+  calibDrift:0, assessment:null,
   view:'gauge', sortKey:'date', sortDir:'desc', openCard:null, focusField:null, lastQuery:null,
   scan:{ stream:null, running:false, lastCheck:0, quality:null, shot:null, result:null, busy:false, error:null },
   batch:null, batchCalib:null,
@@ -2016,7 +2056,7 @@ function setView(v) {
   const b=document.getElementById('collBtn');
   if (b) {
     const n=loadStore().cards.length;
-    b.textContent = v==='gauge' ? `Collection (${n})` : 'Back to gauge';
+    b.innerHTML = v==='gauge' ? `<span class="wide">Collection</span><span class="narrow">Cards</span> (${n})` : 'Back<span class="wide"> to gauge</span>';
     b.dataset.on = v==='collection'?'1':'0';
   }
   if (v==='collection') renderCollection();
@@ -2068,7 +2108,13 @@ function assessCard(det, quad, guideSource, rec) {
   if (det.pxPerMm!==null && det.pxPerMm<8)
     flag('check',`only ${det.pxPerMm.toFixed(1)} px/mm — one pixel is ${(1/det.pxPerMm).toFixed(2)} mm`);
 
-  const weak=EDGE_KEYS.filter(k=>!det.fits[k]||det.fits[k].kept<22||det.fits[k].rms>1.2);
+  // An edge you placed yourself has no machine fit, which is not the same as a
+  // bad one - it should not be reported as loose.
+  const weak=EDGE_KEYS.filter(k=>{
+    const f=det.fits[k];
+    if (f && f.edited) return false;
+    return !f || f.kept<22 || f.rms>1.2;
+  });
   if (weak.length) flag('check','loose edge fit on '+weak.join(', '));
 
   const assumed=EDGE_KEYS.filter(k=>guideSource[k]==='mirrored'||guideSource[k]==='none');
@@ -2350,7 +2396,7 @@ function renderBatch() {
   if (sc) sc.onclick=()=>{
     b.items.forEach((it,i)=>{ if (it.level==='ok'&&it.rec&&!it.saved) saveBatchItem(i); });
     const cb=document.getElementById('collBtn');
-    if (cb) cb.textContent='Collection ('+loadStore().cards.length+')';
+    if (cb) cb.innerHTML='<span class="wide">Collection</span><span class="narrow">Cards</span> ('+loadStore().cards.length+')';
   };
 
   const br=document.getElementById('batchReset');
@@ -2360,7 +2406,7 @@ function renderBatch() {
     btn.onclick=()=>{
       saveBatchItem(+btn.dataset.save);
       const cb=document.getElementById('collBtn');
-      if (cb) cb.textContent='Collection ('+loadStore().cards.length+')';
+      if (cb) cb.innerHTML='<span class="wide">Collection</span><span class="narrow">Cards</span> ('+loadStore().cards.length+')';
     };
   });
 
@@ -2729,7 +2775,7 @@ function renderScan() {
       if (!res.ok) { b.textContent='Failed'; return; }
       b.textContent='Saved '+res.id; b.disabled=true;
       const cb=document.getElementById('collBtn');
-      if (cb) cb.textContent='Collection ('+loadStore().cards.length+')';
+      if (cb) cb.innerHTML='<span class="wide">Collection</span><span class="narrow">Cards</span> ('+loadStore().cards.length+')';
     };
     return;
   }
@@ -2945,6 +2991,7 @@ function renderFits() {
   if (state.step!==1||!state.fits) { wrap.innerHTML=''; return; }
   wrap.innerHTML='<div class="fits">'+EDGE_KEYS.map(k=>{
     const f=state.fits[k];
+    if (f&&f.edited) return `<div data-q="soft"><span>${k}</span><b>by hand</b></div>`;
     if (!f) return `<div data-q="bad"><span>${k}</span><b>none</b></div>`;
     const q=(f.kept>=30&&f.rms<0.8)?'good':(f.kept>=22&&f.rms<1.2)?'soft':'bad';
     const mg=f.marginPct===null?'' :
@@ -4024,7 +4071,7 @@ canvas.addEventListener('pointerdown', e => {
     }
     state.drag={kind:'handle',...best};
     state.edges[best.key][best.i]={x:p.x/state.scale,y:p.y/state.scale};
-    if (state.fits) { state.fits[best.key]=null; renderFits(); }
+    if (state.fits) { state.fits[best.key]={ edited:true }; renderFits(); }
   } else {
     const g=state.guides;
     const cand=[
@@ -4085,7 +4132,7 @@ canvas.addEventListener('keydown', e => {
     if (state.drag&&state.drag.kind==='handle') lastHandle={key:state.drag.key,i:state.drag.i};
     const pt=state.edges[lastHandle.key][lastHandle.i];
     pt.x+=m[0]; pt.y+=m[1];
-    if (state.fits) { state.fits[lastHandle.key]=null; renderFits(); }
+    if (state.fits) { state.fits[lastHandle.key]={ edited:true }; renderFits(); }
   } else {
     if (state.drag&&state.drag.kind==='guide') lastGuide=state.drag.key;
     if (state.guideSource) { state.guideSource[lastGuide]='edited'; renderGuideNote(); }
@@ -4116,6 +4163,30 @@ function buildScale() {
   document.getElementById('ticks').innerHTML=tol.map(t=>`<span>${t.max}</span>`).join('');
 }
 
+// Exactly the assessment the scan and batch screens run. It was missing here,
+// which is why the gauge could show a confident grade on the same measurement
+// the scan screen had refused to stand behind.
+function assessCurrent(mm, worst) {
+  if (!state.edges || !state.flat) return null;
+  const quad=cornersFromEdges(state.edges);
+  if (!quad) return null;
+  return assessCard(
+    { fits:state.fits||{}, pxPerMm:state.pxPerMm, calibDrift:state.calibDrift||0 },
+    quad,
+    state.guideSource||{},
+    { side:state.side, centering:{ ...mm, worst } }
+  );
+}
+
+function renderConcerns() {
+  const el=document.getElementById('concerns');
+  if (!el) return;
+  const a=state.assessment;
+  if (!a || !a.reasons.length) { el.innerHTML=''; el.dataset.lv=''; return; }
+  el.dataset.lv=a.level;
+  el.innerHTML=a.reasons.map(r=>`<span>${r}</span>`).join('');
+}
+
 function measure() {
   const f=state.flat,g=state.guides; if (!f||!g) return;
   const left=g.left,right=f.w-g.right,top=g.top,bottom=f.h-g.bottom;
@@ -4131,7 +4202,14 @@ function measure() {
   document.getElementById('gaps').innerHTML=
     `L <b>${mm(left)}</b> mm &nbsp; R <b>${mm(right)}</b> mm<br>`+
     `T <b>${mm(top)}</b> mm &nbsp; B <b>${mm(bottom)}</b> mm`;
-  updateVerdict(Math.max(hPct??0,vPct??0), hPct!==null&&vPct!==null);
+  const worst=Math.max(hPct??0,vPct??0);
+  const mmv=v=>+(v*f.mmPerPx).toFixed(3);
+  state.assessment=assessCurrent(
+    { leftMm:mmv(left), rightMm:mmv(right), topMm:mmv(top), bottomMm:mmv(bottom) },
+    +worst.toFixed(2));
+
+  updateVerdict(worst, hPct!==null&&vPct!==null);
+  renderConcerns();
 }
 
 function ratio(a,b){ const t=a+b; if(t<=0||a<0||b<0) return null; return Math.max(a,b)/t*100; }
@@ -4152,6 +4230,19 @@ function updateVerdict(worst,valid) {
     if (needle) needle.style.left='-99px';
     return;
   }
+  // A failed assessment withholds the grade, matching the scan screen. Showing
+  // a confident number under a list of reasons not to believe it is the exact
+  // thing this tool exists to avoid.
+  const a=state.assessment;
+  if (a && a.level==='failed') {
+    el.textContent='\u2014';
+    el.style.color='var(--fail)';
+    note.innerHTML='This measurement did not pass its checks. See below, and fix the guides '
+      + 'or the photo before reading a grade from it.';
+    if (needle) needle.style.left='-99px';
+    return;
+  }
+
   // A grade computed from guides that cannot both be right is worse than none.
   if (state.frameSkew>1.5) {
     el.textContent='\u2014';
