@@ -5,7 +5,7 @@
    this file, so this is the only thing to replace when updating.
    =========================================================================== */
 
-const VERSION = 'v41';
+const VERSION = 'v42';
 
 (function boot() {
 
@@ -517,7 +517,7 @@ const state = {
   sampled:{bg:null,card:null}, pickMode:null, sleeve:null, pxPerMm:null,
   cardType:'standard', aspectWarn:null, guideQuality:null, guideSource:null, letterbox:null,
   frameSkew:1, frameMm:null, guideConsensus:null, guideBacking:0,
-  calibDrift:0, assessment:null,
+  calibDrift:0, assessment:null, sleeveMode:false,
   view:'gauge', sortKey:'date', sortDir:'desc', openCard:null, focusField:null, lastQuery:null,
   scan:{ stream:null, running:false, lastCheck:0, quality:null, shot:null, result:null, busy:false, error:null },
   batch:null, batchCalib:null,
@@ -767,20 +767,32 @@ function scanRay(px,bg,x0,y0,dx,dy,steps,mmPerStep) {
     if (v>bestV) { bestV=v; bestT=t; }
   }
 
-  let doubled=false;
+  // A sleeve puts a second edge just inside the first. Record where it is, not
+  // only that it exists - a card always sits INSIDE its sleeve, so that inner
+  // edge is the card whenever the outer one turned out to be plastic.
+  let doubled=false, innerT=null, innerV=0;
   const lo=Math.round(0.4/mmPerStep), hi=Math.round(1.6/mmPerStep);
   for (let t=bestT+Math.max(3,lo); t<=bestT+hi; t++) {
     const a=lum(t-2), b=lum(t+2);
     if (a===null||b===null) continue;
-    if (Math.abs(b-a)>bestV*0.55) { doubled=true; break; }
+    const v=Math.abs(b-a);
+    if (v>bestV*0.55) { doubled=true; if (v>innerV) { innerV=v; innerT=t; } }
   }
 
-  const g0=grad[bestT-1], g1=grad[bestT], g2=grad[bestT+1];
-  let t=bestT;
-  if (g0!==undefined&&g1!==undefined&&g2!==undefined) {
+  // With the sleeve switch on, the inner edge of a pair wins.
+  let useT=bestT;
+  if (state.sleeveMode && innerT!==null) useT=innerT;
+
+  const sub=(c)=>{
+    const a=lum(c-2), b=lum(c-1+1);   // recompute locally, grad only spans the first window
+    const gm=k=>{ const p=lum(k-2), q=lum(k+2); return (p===null||q===null)?null:Math.abs(q-p); };
+    const g0=gm(c-1), g1=gm(c), g2=gm(c+1);
+    if (g0===null||g1===null||g2===null) return c;
     const den=g0-2*g1+g2;
-    if (Math.abs(den)>1e-6) t+=Math.max(-1,Math.min(1,0.5*(g0-g2)/den));
-  }
+    return Math.abs(den)>1e-6 ? c+Math.max(-1,Math.min(1,0.5*(g0-g2)/den)) : c;
+  };
+  const t=sub(useT);
+
   return { x:x0+dx*t, y:y0+dy*t, doubled, offset:t-hit, depth:t };
 }
 
@@ -2098,6 +2110,11 @@ function assessCard(det, quad, guideSource, rec) {
   if (det.calibDrift>0.4)
     flag('check',`calibrated colours did not fit this photo — used its own background instead`);
 
+  // A second edge running alongside the card is a sleeve, and the detector can
+  // settle on either line.
+  if (det.sleeve>0.35)
+    flag('check',`a second edge alongside the card on ${Math.round(det.sleeve*100)}% of scan lines — sleeved, so the line found may be the plastic`);
+
   const a=aspectCheck(quad);
   if (a && a.off>0.05) flag('failed',`shape is ${a.seen.toFixed(3)} against ${a.want.toFixed(3)} expected — wrong card type, or an edge line is off`);
 
@@ -2113,7 +2130,7 @@ function assessCard(det, quad, guideSource, rec) {
   const weak=EDGE_KEYS.filter(k=>{
     const f=det.fits[k];
     if (f && f.edited) return false;
-    return !f || f.kept<22 || f.rms>1.2;
+    return !f || f.kept<30 || f.rms>1.2;
   });
   if (weak.length) flag('check','loose edge fit on '+weak.join(', '));
 
@@ -2938,7 +2955,7 @@ function runDetect() {
 
     // rms is what says whether the line is right; kept only needs to be enough
     // to fit one, now that clutter is deliberately discarded upstream.
-    const weak=EDGE_KEYS.filter(k=>!res.fits[k]||res.fits[k].kept<22||res.fits[k].rms>1.2);
+    const weak=EDGE_KEYS.filter(k=>!res.fits[k]||res.fits[k].kept<30||res.fits[k].rms>1.2);
     if (res.tightest!==null && res.tightest<2) {
       setFlag('warn',`The tightest margin is only ${res.tightest.toFixed(1)}% of the frame. The background was still found, but around 10% on every side reads much more cleanly.`);
     } else if (state.letterbox) {
@@ -2993,7 +3010,7 @@ function renderFits() {
     const f=state.fits[k];
     if (f&&f.edited) return `<div data-q="soft"><span>${k}</span><b>by hand</b></div>`;
     if (!f) return `<div data-q="bad"><span>${k}</span><b>none</b></div>`;
-    const q=(f.kept>=30&&f.rms<0.8)?'good':(f.kept>=22&&f.rms<1.2)?'soft':'bad';
+    const q=(f.kept>=50&&f.rms<0.8)?'good':(f.kept>=30&&f.rms<1.2)?'soft':'bad';
     const mg=f.marginPct===null?'' :
       `<em ${(f.marginPct<2||f.marginPct>22)?'data-tight="1"':''}>margin ${f.marginPct.toFixed(1)}%</em>`;
     return `<div data-q="${q}"><span>${k}</span><b>${f.kept}/${f.total} · ${f.rms.toFixed(2)}px</b>${mg}</div>`;
@@ -3027,11 +3044,15 @@ function fitScale() {
 }
 
 function zoomButton() {
+  // A phone photo can be enormous, so fit lands well under 10%. The minimum
+  // follows it, otherwise the thumb sits pinned at the left and any drag jumps.
+  const fitPct=Math.max(1, Math.floor(fitScale()*100));
+  const lo=Math.min(fitPct, 10);
   return `<div class="zoom">
     <label for="zoomRange">Zoom</label>
     <button id="zoomFit" type="button">Fit</button>
-    <input type="range" id="zoomRange" min="10" max="400" step="1" value="${state.zoomPct||100}">
-    <b id="zoomVal">${state.zoomPct||100}%</b>
+    <input type="range" id="zoomRange" min="${lo}" max="400" step="1" value="${state.zoomPct||fitPct}">
+    <b id="zoomVal">${state.zoomPct||fitPct}%</b>
   </div>`;
 }
 
@@ -3911,9 +3932,9 @@ function resize() {
   if (state.zoomPct===null) {
     const val=document.getElementById('zoomVal');
     const range=document.getElementById('zoomRange');
-    const pct=Math.round(state.scale*100);
+    const pct=Math.max(1, Math.round(state.scale*100));
     if (val) val.textContent=pct+'%';
-    if (range) range.value=pct;
+    if (range) { range.min=String(Math.min(pct,10)); range.value=pct; }
   }
 
   draw();
@@ -4171,7 +4192,8 @@ function assessCurrent(mm, worst) {
   const quad=cornersFromEdges(state.edges);
   if (!quad) return null;
   return assessCard(
-    { fits:state.fits||{}, pxPerMm:state.pxPerMm, calibDrift:state.calibDrift||0 },
+    { fits:state.fits||{}, pxPerMm:state.pxPerMm,
+      calibDrift:state.calibDrift||0, sleeve:state.sleeve||0 },
     quad,
     state.guideSource||{},
     { side:state.side, centering:{ ...mm, worst } }
