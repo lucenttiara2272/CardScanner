@@ -5,7 +5,7 @@
    this file, so this is the only thing to replace when updating.
    =========================================================================== */
 
-const VERSION = 'v47';
+const VERSION = 'v49';
 
 (function boot() {
 
@@ -2217,7 +2217,10 @@ async function ocrReady() {
       // The number is digits and a slash. Narrowing the alphabet is the single
       // biggest accuracy win available here.
       tessedit_char_whitelist:'0123456789/ABCDEFGHIJKLMNOPQRSTUVWXYZ',
-      tessedit_pageseg_mode:'7'          // one line of text, not a page
+      // Block mode, not single-line. The bottom crop routinely holds two lines -
+      // the rules text above and the illustrator/set/number line below - and
+      // single-line mode garbles anything with more than one.
+      tessedit_pageseg_mode:'6'
     });
     ocrState='ready';
     console.log('[ocr] ready');
@@ -2261,47 +2264,148 @@ function numberCanvas(flat) {
   return c;
 }
 
-// "097/084" is the target. Promo codes are a fallback.
-function parseNumber(text) {
-  const t=(text||'').replace(/\s+/g,' ').toUpperCase();
-  const m=t.match(/(\d{1,3})\s*\/\s*(\d{1,3})/);
-  if (m) return { query:`${m[1]}/${m[2]}`, number:parseInt(m[1],10), total:parseInt(m[2],10) };
-  const p=t.match(/\b([A-Z]{2,4}\s?\d{2,3})\b/);
-  if (p) return { query:p[1].replace(/\s/g,''), number:null, total:null };
-  return null;
+// The set code beside the number - PRE, SVI, OBF - turns a guess into a lookup.
+// A number on its own is shared by every reverse holo and reprint that carries
+// it; a set code plus a number is very close to a unique key. Codes are pulled
+// from the API once and cached, so a token only counts as a set code if it
+// really is one, and ILLUS or GAME cannot be mistaken for one.
+let setCatalogue=null;
+const LANG_TOKENS=new Set(['EN','JP','FR','DE','IT','ES','PT','KO','ZH','NL','RU']);
+
+async function loadSetCodes() {
+  if (setCatalogue) return setCatalogue;
+  setCatalogue=new Map();
+  try {
+    const headers={}; const k=apiKey(); if (k) headers['X-Api-Key']=k;
+    const res=await fetch(`${API_BASE}/sets?pageSize=500`,{ headers });
+    if (res.ok)
+      for (const st of ((await res.json()).data||[]))
+        if (st.ptcgoCode)
+          setCatalogue.set(st.ptcgoCode.toUpperCase(),
+                           { id:st.id, name:st.name, total:st.printedTotal });
+  } catch(e) { console.log('[sets] catalogue unavailable, falling back to number only'); }
+  console.log(`[sets] ${setCatalogue.size} set codes cached`);
+  return setCatalogue;
 }
 
-async function readCardNumber(flat) {
+// Everything worth having out of the bottom line, in one pass.
+function parseStripText(text, codes) {
+  const t=(text||'').toUpperCase().replace(/[|]/g,'I');
+  const out={ number:null, total:null, setCode:null, regMark:null };
+
+  const m=t.match(/(\d{1,3})\s*\/\s*(\d{1,3})/);
+  if (m) { out.number=parseInt(m[1],10); out.total=parseInt(m[2],10); }
+  else {
+    const solo=t.match(/\b(\d{1,3})\b(?!\s*\/)/);
+    if (solo) out.number=parseInt(solo[1],10);
+  }
+
+  if (codes && codes.size)
+    for (const tok of (t.match(/\b[A-Z]{2,4}\b/g)||[]))
+      if (!LANG_TOKENS.has(tok) && codes.has(tok)) { out.setCode=tok; break; }
+
+  // The regulation mark sits in its own box immediately before the set code.
+  // Anchoring it there matters: a bare single letter anywhere on the line picks
+  // up initials out of the illustrator credit instead.
+  if (out.setCode) {
+    const rm=t.match(new RegExp('(?:^|[^A-Z])([D-K])\\\\s+'+out.setCode+'\\\\b'));
+    if (rm) out.regMark=rm[1];
+  }
+
+  return out;
+}
+
+// The card name, read from the top band. Weaker than the number - names sit in
+// stylised type over artwork - so it is only ever used to narrow a number that
+// already matched several cards.
+function nameCanvas(flat) {
+  const bandPx=Math.max(1, Math.round(9*(1/flat.mmPerPx)));
+  const wCrop=Math.max(1, Math.round(flat.w*0.72));
+  const up=Math.max(1, Math.min(4, 900/wCrop));
+  const c=document.createElement('canvas');
+  c.width=Math.round(wCrop*up); c.height=Math.round(bandPx*up);
+  const cx=c.getContext('2d',{ willReadFrequently:true });
+  cx.imageSmoothingQuality='high';
+  cx.drawImage(flat.canvas, 0,0, wCrop,bandPx, 0,0, c.width,c.height);
+  return c;
+}
+
+async function readCardFacts(flat) {
   if (!(await ocrReady())) return { ok:false, why:'number reading is unavailable here' };
+  const codes=await loadSetCodes();
   try {
     const r=await ocrWorker.recognize(numberCanvas(flat));
     const text=(r&&r.data&&r.data.text)||'';
     const conf=(r&&r.data&&r.data.confidence)||0;
-    const parsed=parseNumber(text);
-    console.log(`[ocr] "${text.trim().replace(/\n/g,' ')}" conf=${Math.round(conf)}`);
-    return { ok:!!parsed, text:text.trim(), conf, parsed, why:parsed?null:'no number found on the card' };
+    const f=parseStripText(text, codes);
+    console.log(`[ocr] "${text.trim().replace(/\n/g,' | ')}" conf=${Math.round(conf)} `
+      + `-> ${f.setCode||'??'} ${f.number!=null?f.number:'??'}${f.total?'/'+f.total:''}`);
+    return { ok:f.number!=null, text:text.trim(), conf, facts:f,
+             why:f.number!=null?null:'no number found on the card' };
   } catch(e) {
     return { ok:false, why:'number reading failed' };
   }
 }
 
+async function readCardName(flat) {
+  if (ocrState!=='ready') return null;
+  try {
+    const r=await ocrWorker.recognize(nameCanvas(flat));
+    const raw=((r&&r.data&&r.data.text)||'').split('\n')[0].trim();
+    const cleaned=raw.replace(/[^A-Za-z' -]/g,' ').replace(/\s+/g,' ').trim();
+    console.log(`[ocr] name band -> "${cleaned}"`);
+    return cleaned.length>=3 ? cleaned : null;
+  } catch(e) { return null; }
+}
+
 // The bar for adding a card without asking. Everything else goes to review.
 async function autoIdentify(flat) {
-  const read=await readCardNumber(flat);
+  const read=await readCardFacts(flat);
   if (!read.ok) return { confident:false, why:read.why||'number not read', read };
-  if (read.conf < OCR_MIN_CONF)
-    return { confident:false, read,
-             why:`read as ${read.parsed.query}, only ${Math.round(read.conf)}% sure` };
 
+  const f=read.facts;
+  const n=String(f.number);
+
+  // Set code plus number: as close to an exact lookup as this data gets. The
+  // code was validated against the real catalogue, which is strong evidence in
+  // its own right, so a middling OCR score is tolerable here.
+  if (f.setCode) {
+    let hits=[];
+    for (const q of [`set.ptcgoCode:${f.setCode} number:${n}`,
+                     `set.ptcgoCode:${f.setCode} number:"${n}"`]) {
+      try { hits=(await apiGet(q,24)).map(mapCard); } catch(e) { hits=[]; }
+      if (hits.length) break;
+    }
+    if (hits.length===1 && read.conf>=45)
+      return { confident:true, hit:hits[0], read, via:`${f.setCode} ${n}` };
+    if (hits.length>1)
+      return { confident:false, read, hits, why:`${hits.length} cards are ${f.setCode} ${n}` };
+  }
+
+  // No usable set code: fall back to the number, then try the name to break a tie.
   let hits=[];
-  try { hits=await searchCards(read.parsed.query); }
+  try { hits=await searchCards(f.total?`${n}/${f.total}`:n); }
   catch(e) { return { confident:false, why:'lookup failed', read }; }
 
-  if (!hits.length)  return { confident:false, why:`nothing matched ${read.parsed.query}`, read, hits };
-  // Same number in more than one printing - reverse holos, promos, reprints.
-  // Guessing between them is exactly the mistake worth avoiding.
-  if (hits.length>1) return { confident:false, why:`${hits.length} cards share ${read.parsed.query}`, read, hits };
-  return { confident:true, hit:hits[0], read };
+  if (!hits.length) return { confident:false, why:`nothing matched ${n}`, read, hits };
+
+  if (hits.length>1) {
+    const nm=await readCardName(flat);
+    if (nm) {
+      const key=nm.toLowerCase();
+      const narrowed=hits.filter(h=>h.name.toLowerCase().indexOf(key)>=0
+                                 || key.indexOf(h.name.toLowerCase())>=0);
+      if (narrowed.length===1 && read.conf>=OCR_MIN_CONF)
+        return { confident:true, hit:narrowed[0], read, via:`${nm} ${n}` };
+      if (narrowed.length) hits=narrowed;
+    }
+  }
+
+  if (hits.length>1)
+    return { confident:false, why:`${hits.length} cards share ${n}`, read, hits };
+  if (read.conf < OCR_MIN_CONF)
+    return { confident:false, read, why:`read as ${n}, only ${Math.round(read.conf)}% sure` };
+  return { confident:true, hit:hits[0], read, via:n };
 }
 
 // ---- hands-free capture ----
@@ -2343,7 +2447,8 @@ async function quickAuto(flat) {
   if (res.confident) {
     const w=ownedAdd(res.hit, sc.result.thumb);
     if (w.ok) {
-      sc.lastAdded=`${res.hit.name} — ${res.hit.set} ${res.hit.number}`;
+      sc.lastAdded=`${res.hit.name} — ${res.hit.set} ${res.hit.number}`
+        + (res.via?` (read ${res.via})`:'');
       sc.lastReview=null;
       sc.autoStats.added++;
       quickNext();
@@ -2352,9 +2457,11 @@ async function quickAuto(flat) {
     res.why=w.error;
   }
 
+  const f=(res.read&&res.read.facts)||{};
   const r=reviewAdd({
     thumb:sc.result.thumb, strip:sc.result.reviewStrip,
     ocr:res.read?res.read.text:'', conf:res.read?Math.round(res.read.conf||0):0,
+    setCode:f.setCode||null, number:f.number!=null?f.number:null, total:f.total||null,
     why:res.why||'uncertain'
   });
   if (!r.ok) { sc.result.autoBusy=false; sc.result.autoMsg=r.error; renderScan(); return; }
@@ -2395,10 +2502,10 @@ function renderReview() {
       <button class="btn" id="rvBack">&larr; Back to queue (${st.items.length})</button>
       <div class="scanCard"><img src="${it.thumb}" alt=""></div>
       ${it.strip?`<div class="strip2"><div class="win"><img src="${it.strip}" alt="bottom of card"></div>
-        <span>${qaEsc(it.why||'')}${it.ocr?` &middot; read as “${qaEsc(it.ocr.replace(/\n/g,' '))}” (${it.conf}%)`:''}</span></div>`:''}
+        <span>${qaEsc(it.why||'')}${it.setCode?` &middot; set ${qaEsc(it.setCode)}`:''}${it.ocr?` &middot; read “${qaEsc(it.ocr.replace(/\n/g,' ').slice(0,60))}” (${it.conf}%)`:''}</span></div>`:''}
       <div class="qaSearch">
         <input id="rvQ" type="search" inputmode="search" autocomplete="off"
-               placeholder="Number or name" value="${qaEsc(rv.query!=null?rv.query:(it.ocr||'').match(/\d{1,3}\s*\/\s*\d{1,3}/)?(it.ocr.match(/\d{1,3}\s*\/\s*\d{1,3}/)[0].replace(/\s/g,'')):'')}">
+               placeholder="Number or name" value="${qaEsc(rv.query!=null?rv.query:reviewGuess(it))}">
         <button class="btn" data-primary id="rvGo">${rv.searching?'Searching…':'Find'}</button>
       </div>
       ${rv.msg?`<p class="scanWarn">${qaEsc(rv.msg)}</p>`:''}
@@ -2438,6 +2545,14 @@ function renderReview() {
     state.review={ open:b.dataset.open, hits:null, query:null, msg:null, searching:false };
     renderReview();
   });
+}
+
+// Best starting point for the box: whatever was actually parsed off the card.
+function reviewGuess(it) {
+  if (it.number!=null && it.total) return `${it.number}/${it.total}`;
+  if (it.number!=null) return String(it.number);
+  const m=(it.ocr||'').match(/\d{1,3}\s*\/\s*\d{1,3}/);
+  return m ? m[0].replace(/\s/g,'') : '';
 }
 
 async function reviewSearch() {
@@ -3973,6 +4088,7 @@ function renderScan() {
     // Warm the reader up now rather than stalling on the first card. If it
     // cannot load, auto capture still works and everything goes to review.
     if (sc.autoId && ocrState==='idle') {
+      loadSetCodes();
       const ok=await ocrReady();
       if (!ok) { sc.lastReview='number reading unavailable — cards will go to review'; renderScan(); }
     }
