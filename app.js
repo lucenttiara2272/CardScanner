@@ -5,7 +5,7 @@
    this file, so this is the only thing to replace when updating.
    =========================================================================== */
 
-const VERSION = 'v43';
+const VERSION = 'v44';
 
 (function boot() {
 
@@ -621,8 +621,40 @@ function stripLetterbox(img) {
 // DETECTION
 // ===========================================================================
 
-const DETECT_W = 900;
+// Longest side of the image the edge scan actually runs on. Everything above this
+// is discarded before detection, so this - not the camera, not MAX_EDGE - is the
+// real ceiling on how precisely a corner can be placed. Cost scales with area, so
+// the [detect] log reports the working size; raise this until the timing hurts.
+const DETECT_W = 1400;
 const SAMPLES = 70;
+
+// Fit quality in millimetres rather than pixels. A pixel threshold silently
+// changes meaning whenever DETECT_W moves - identical physical scatter reads as
+// 1.2px at one working size and 1.9px at another - so these gates are in mm and
+// hold still no matter what the working size is set to.
+const FIT_RMS_MM = 0.10;   // above this the fitted line is not really the edge
+const FIT_KEPT   = 0.40;   // fraction of scan lines that have to agree
+const FIT_BAD_MM = 0.50;   // beyond this the side is unusable, not merely loose
+
+function fitKeptFrac(f){ return f ? f.kept/(f.total||SAMPLES) : 0; }
+
+// Loose: worth saying out loud, but the reading still stands.
+function fitWeak(f) {
+  if (!f) return true;
+  if (f.edited) return false;
+  if (fitKeptFrac(f) < FIT_KEPT) return true;
+  return f.rmsMm!=null && f.rmsMm > FIT_RMS_MM;
+}
+
+// Unusable: the line was fitted through scatter and nothing downstream of it
+// means anything. A right edge holding 12 of 70 lines with millimetres of spread
+// is this case, not the one above, and a quad built on it is not a card.
+function fitUnusable(f) {
+  if (!f) return true;
+  if (f.edited) return false;
+  if (fitKeptFrac(f) < 0.20) return true;
+  return f.rmsMm!=null && f.rmsMm > FIT_BAD_MM;
+}
 
 function getPixels(img) {
   const s=Math.min(1,DETECT_W/Math.max(img.width,img.height));
@@ -631,6 +663,8 @@ function getPixels(img) {
   c.width=w; c.height=h;
   const cc=c.getContext('2d');
   cc.drawImage(img,0,0,w,h);
+  console.log(`[detect] working at ${w}\u00d7${h} from ${img.width}\u00d7${img.height}`+
+              (s<1?` (scaled ${s.toFixed(3)})`:' (full size)'));
   return { d:cc.getImageData(0,0,w,h).data, w, h, scale:s };
 }
 
@@ -1019,6 +1053,9 @@ function detectEdges(img) {
     fits[key]={
       kept:fit.keep.length, total:SAMPLES,
       rms:fit.rms/px.scale,
+      // fit.rms and pxPerMm are both in detection pixels, so their ratio is a
+      // millimetre figure that stays true whatever DETECT_W happens to be.
+      rmsMm: pxPerMm ? fit.rms/pxPerMm : null,
       doubled: pts.length?doubled/pts.length:0,
       shadowMm: offsets.length?median(offsets)*mmPerStep:0,
       marginPct: usable ? marginPct[key] : null
@@ -2149,12 +2186,11 @@ function assessCard(det, quad, guideSource, rec) {
 
   // An edge you placed yourself has no machine fit, which is not the same as a
   // bad one - it should not be reported as loose.
-  const weak=EDGE_KEYS.filter(k=>{
-    const f=det.fits[k];
-    if (f && f.edited) return false;
-    return !f || f.kept<30 || f.rms>1.2;
-  });
-  if (weak.length) flag('check','loose edge fit on '+weak.join(', '));
+  const weak=EDGE_KEYS.filter(k=>fitWeak(det.fits[k]));
+  const dead=EDGE_KEYS.filter(k=>fitUnusable(det.fits[k]));
+  if (dead.length)
+    flag('failed',`no usable edge on ${dead.join(', ')} — the line there was fitted through scatter, so the quad and everything measured from it are unreliable`);
+  else if (weak.length) flag('check','loose edge fit on '+weak.join(', '));
 
   const assumed=EDGE_KEYS.filter(k=>guideSource[k]==='mirrored'||guideSource[k]==='none');
   if (assumed.length) flag('check','inner border assumed on '+assumed.join(', '));
@@ -2840,8 +2876,10 @@ function renderScan() {
         <span>Collector number &mdash; scroll sideways if you need to.</span>
       </div>`:''}
       <div class="scanNums" ${bad?'data-doubt="1"':''}>
-        <div class="scanBig"><b>${Math.round(leftShare(c))}</b><i>/</i><b>${100-Math.round(leftShare(c))}</b><span>left / right</span></div>
-        <div class="scanBig"><b>${Math.round(topShare(c))}</b><i>/</i><b>${100-Math.round(topShare(c))}</b><span>top / bottom</span></div>
+        <div class="scanBig">${bad?'<b>&mdash;</b><i>/</i><b>&mdash;</b>'
+          :`<b>${Math.round(leftShare(c))}</b><i>/</i><b>${100-Math.round(leftShare(c))}</b>`}<span>left / right</span></div>
+        <div class="scanBig">${bad?'<b>&mdash;</b><i>/</i><b>&mdash;</b>'
+          :`<b>${Math.round(topShare(c))}</b><i>/</i><b>${100-Math.round(topShare(c))}</b>`}<span>top / bottom</span></div>
         ${verdictBlock}
         <p class="scanMm">L ${c.leftMm.toFixed(2)} &nbsp; R ${c.rightMm.toFixed(2)} mm<br>
            T ${c.topMm.toFixed(2)} &nbsp; B ${c.bottomMm.toFixed(2)} mm<br>
@@ -3026,7 +3064,7 @@ function runDetect() {
 
     // rms is what says whether the line is right; kept only needs to be enough
     // to fit one, now that clutter is deliberately discarded upstream.
-    const weak=EDGE_KEYS.filter(k=>!res.fits[k]||res.fits[k].kept<30||res.fits[k].rms>1.2);
+    const weak=EDGE_KEYS.filter(k=>fitWeak(res.fits[k]));
     if (res.tightest!==null && res.tightest<2) {
       setFlag('warn',`The tightest margin is only ${res.tightest.toFixed(1)}% of the frame. The background was still found, but around 10% on every side reads much more cleanly.`);
     } else if (state.letterbox) {
@@ -3081,10 +3119,15 @@ function renderFits() {
     const f=state.fits[k];
     if (f&&f.edited) return `<div data-q="soft"><span>${k}</span><b>by hand</b></div>`;
     if (!f) return `<div data-q="bad"><span>${k}</span><b>none</b></div>`;
-    const q=(f.kept>=50&&f.rms<0.8)?'good':(f.kept>=30&&f.rms<1.2)?'soft':'bad';
+    const kf=fitKeptFrac(f), mm=f.rmsMm;
+    const q = fitUnusable(f) ? 'bad'
+            : (kf>=0.7 && (mm==null || mm<FIT_RMS_MM*0.6)) ? 'good'
+            : fitWeak(f) ? 'bad' : 'soft';
     const mg=f.marginPct===null?'' :
       `<em ${(f.marginPct<2||f.marginPct>22)?'data-tight="1"':''}>margin ${f.marginPct.toFixed(1)}%</em>`;
-    return `<div data-q="${q}"><span>${k}</span><b>${f.kept}/${f.total} · ${f.rms.toFixed(2)}px</b>${mg}</div>`;
+    // Scatter in mm, so the number means the same thing at any working size.
+    const scatter = mm!=null ? `${mm.toFixed(3)}mm` : `${f.rms.toFixed(2)}px`;
+    return `<div data-q="${q}"><span>${k}</span><b>${f.kept}/${f.total} · ${scatter}</b>${mg}</div>`;
   }).join('')+'</div>';
 }
 
