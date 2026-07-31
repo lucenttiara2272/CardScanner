@@ -5,7 +5,7 @@
    this file, so this is the only thing to replace when updating.
    =========================================================================== */
 
-const VERSION = 'v42';
+const VERSION = 'v43';
 
 (function boot() {
 
@@ -489,7 +489,14 @@ const CARD_TYPES = {
   sports:  { label:'Sports 2.5×3.5"', w:63.5, h:88.9 }
 };
 let CARD_MM = { ...CARD_TYPES.standard };
-const MAX_EDGE = 1200;
+// Rectified card size, long edge, in pixels. This is the hard limit on
+// measurement precision: at 1200 an 88mm card is 13.6 px/mm, so one pixel is
+// 0.073mm and a grade boundary can sit less than two pixels away. MIN is a
+// floor for small source photos; MAX lets a sharp, frame-filling photo keep the
+// detail it actually carries. Raising MAX costs time quadratically - the
+// homography resample is per-pixel in JS - so 2400 is a deliberate compromise.
+const MIN_EDGE = 1200;
+const MAX_EDGE = 2400;
 const TOLERANCE = {
   front:[{g:10,max:55},{g:9,max:60},{g:8,max:65},{g:7,max:70},{g:6,max:75},{g:5,max:80}],
   back: [{g:10,max:75},{g:9,max:80},{g:8,max:85},{g:7,max:90},{g:6,max:90},{g:5,max:95}]
@@ -1097,7 +1104,14 @@ function straighten(img,quad) {
   const tall=(len(quad[0],quad[3])+len(quad[1],quad[2]))/2;
   const landscape=wide>tall;
   const mmW=landscape?CARD_MM.h:CARD_MM.w, mmH=landscape?CARD_MM.w:CARD_MM.h;
-  const H=Math.round(mmH>mmW?MAX_EDGE:MAX_EDGE*mmH/mmW), W=Math.round(H*mmW/mmH);
+
+  // Match the rectified height to the detail the source actually holds.
+  // Upsampling past that only interpolates - it invents smooth pixels and
+  // flatters the edge fit without adding any real information - so the source
+  // is the ceiling and MIN_EDGE the floor.
+  const nativeH = Math.round(Math.max(tall, wide*mmH/mmW));
+  const H = Math.max(MIN_EDGE, Math.min(nativeH, MAX_EDGE));
+  const W = Math.round(H*mmW/mmH);
 
   const src=document.createElement('canvas');
   src.width=img.width; src.height=img.height;
@@ -1452,12 +1466,17 @@ function buildRecord() {
     centering:{
       leftMm:mm(left), rightMm:mm(right), topMm:mm(top), bottomMm:mm(bottom),
       hPct:+(hPct??0).toFixed(2), vPct:+(vPct??0).toFixed(2),
+      leftPct:+(share(left,right)??0).toFixed(2),
+      topPct:+(share(top,bottom)??0).toFixed(2),
       worst:+worst.toFixed(2),
       ceiling: hit===-1 ? null : tol[hit].g
     },
     corners:null, edges:null,
     quality:{
       pxPerMm: state.pxPerMm?+state.pxPerMm.toFixed(1):null,
+      // The rectified card is what every mm figure is read off, so this - not
+      // the source figure above - is the real limit on precision.
+      measuredPxPerMm: f.mmPerPx?+(1/f.mmPerPx).toFixed(1):null,
       separation: state.borderRef?Math.round(state.borderRef.headroom):null,
       sensitivity: state.cornerSens,
       depthMm: state.edgeDepth,
@@ -1940,7 +1959,8 @@ function renderCardDetail() {
         <h3>Centering &mdash; ${r.side}</h3>
         <p class="mono">L ${f(c.leftMm)} &nbsp; R ${f(c.rightMm)} mm<br>
            T ${f(c.topMm)} &nbsp; B ${f(c.bottomMm)} mm<br>
-           ${f(c.hPct,1)} / ${f(c.vPct,1)} &rarr; worst <b>${f(c.worst,1)}</b><br>
+           L/R ${f(leftShare(c),1)}/${f(100-leftShare(c),1)} &middot; T/B ${f(topShare(c),1)}/${f(100-topShare(c),1)}<br>
+           worst <b>${f(c.worst,1)}</b><br>
            ceiling <b>${c.ceiling??'<5'}</b></p>
         ${r.back?`<h3>Centering &mdash; back</h3>
         <p class="mono">L ${f(r.back.centering.leftMm)} &nbsp; R ${f(r.back.centering.rightMm)} mm<br>
@@ -2110,10 +2130,12 @@ function assessCard(det, quad, guideSource, rec) {
   if (det.calibDrift>0.4)
     flag('check',`calibrated colours did not fit this photo — used its own background instead`);
 
-  // A second edge running alongside the card is a sleeve, and the detector can
-  // settle on either line.
+  // A second edge running alongside the card has three ordinary causes: a
+  // sleeve, a soft shadow cast onto the mat, or the card's own 0.25mm side wall
+  // seen off the optical axis. The detector can settle on either line, and it
+  // cannot tell which cause it is looking at - so it should not claim to.
   if (det.sleeve>0.35)
-    flag('check',`a second edge alongside the card on ${Math.round(det.sleeve*100)}% of scan lines — sleeved, so the line found may be the plastic`);
+    flag('check',`a second edge alongside the card on ${Math.round(det.sleeve*100)}% of scan lines — a sleeve, a shadow, or the card's own thickness`);
 
   const a=aspectCheck(quad);
   if (a && a.off>0.05) flag('failed',`shape is ${a.seen.toFixed(3)} against ${a.want.toFixed(3)} expected — wrong card type, or an edge line is off`);
@@ -2551,6 +2573,7 @@ async function startScan() {
   setScanStatus('Starting camera\u2026');
 
   const tries=[
+    { video:{ facingMode:{ ideal:'environment' }, width:{ ideal:3840 }, height:{ ideal:2160 } }, audio:false },
     { video:{ facingMode:{ ideal:'environment' }, width:{ ideal:2560 }, height:{ ideal:1440 } }, audio:false },
     { video:{ facingMode:{ ideal:'environment' } }, audio:false },
     { video:true, audio:false }                     // laptops with only a front camera
@@ -2576,6 +2599,17 @@ async function startScan() {
   }
 
   state.scan.stream=stream;
+
+  // What the camera is actually giving us, versus what it was capable of. The
+  // preview stream is often far below the sensor's still resolution.
+  try {
+    const t=stream.getVideoTracks()[0];
+    const s=t.getSettings?t.getSettings():{};
+    const cap=t.getCapabilities?t.getCapabilities():{};
+    console.log('[scan] stream settings', s);
+    console.log('[scan] stream capabilities', cap);
+  } catch(e) {}
+
   attachStream(v);
 }
 
@@ -2675,9 +2709,44 @@ function paintVerdict() {
 async function captureScan() {
   const v=document.getElementById('scanVideo');
   if (!v||!v.videoWidth) return;
-  const c=document.createElement('canvas');
-  c.width=v.videoWidth; c.height=v.videoHeight;
-  c.getContext('2d').drawImage(v,0,0);
+
+  let c=null;
+
+  // The preview stream is a compromise the browser makes for smooth playback.
+  // A still pulled through ImageCapture comes off the sensor at its own
+  // resolution, often several times larger, and every extra pixel across a
+  // border is precision that does not have to be guessed at downstream.
+  // Chromium only, and some devices refuse mid-stream, so this stays optional.
+  try {
+    const track = state.scan.stream && state.scan.stream.getVideoTracks()[0];
+    if (track && window.ImageCapture) {
+      const cap = new ImageCapture(track);
+      const pc  = await cap.getPhotoCapabilities().catch(()=>null);
+      const opts = {};
+      if (pc && pc.imageWidth  && pc.imageWidth.max)  opts.imageWidth  = pc.imageWidth.max;
+      if (pc && pc.imageHeight && pc.imageHeight.max) opts.imageHeight = pc.imageHeight.max;
+      const blob = await cap.takePhoto(opts);
+      const bmp  = await createImageBitmap(blob);
+      // Only worth the swap if it is genuinely bigger than the preview frame.
+      if (bmp.width*bmp.height > v.videoWidth*v.videoHeight) {
+        c=document.createElement('canvas');
+        c.width=bmp.width; c.height=bmp.height;
+        c.getContext('2d').drawImage(bmp,0,0);
+        console.log(`[scan] still ${bmp.width}\u00d7${bmp.height} (preview was ${v.videoWidth}\u00d7${v.videoHeight})`);
+      }
+      if (bmp.close) bmp.close();
+    }
+  } catch(e) {
+    console.log('[scan] ImageCapture unavailable, using preview frame:', e && e.name);
+  }
+
+  if (!c) {
+    c=document.createElement('canvas');
+    c.width=v.videoWidth; c.height=v.videoHeight;
+    c.getContext('2d').drawImage(v,0,0);
+    console.log(`[scan] preview frame ${c.width}\u00d7${c.height}`);
+  }
+
   stopScan();
   state.scan.shot=c;
   state.scan.result=null;
@@ -2711,6 +2780,8 @@ function runScanPipeline(canvas) {
   if (!flat) { state.scan.busy=false; state.scan.result={ ok:false, why:'Could not straighten the card.' }; renderScan(); return; }
 
   state.flat=flat; state.quad=quad;
+  console.log(`[scan] source ${canvas.width}\u00d7${canvas.height} \u2192 rectified ${flat.w}\u00d7${flat.h} `
+    + `= ${(1/flat.mmPerPx).toFixed(1)} px/mm measured (source was ${det.pxPerMm?det.pxPerMm.toFixed(1):'?'})`);
   const inner=findInnerBorder(flat);
   state.guides={left:flat.w*0.09,right:flat.w*0.91,top:flat.h*0.09,bottom:flat.h*0.91};
   for (const k of EDGE_KEYS) if (inner.guides[k]!==null) state.guides[k]=inner.guides[k];
@@ -2769,8 +2840,8 @@ function renderScan() {
         <span>Collector number &mdash; scroll sideways if you need to.</span>
       </div>`:''}
       <div class="scanNums" ${bad?'data-doubt="1"':''}>
-        <div class="scanBig"><b>${Math.round(c.hPct)}</b><i>/</i><b>${100-Math.round(c.hPct)}</b><span>left / right</span></div>
-        <div class="scanBig"><b>${Math.round(c.vPct)}</b><i>/</i><b>${100-Math.round(c.vPct)}</b><span>top / bottom</span></div>
+        <div class="scanBig"><b>${Math.round(leftShare(c))}</b><i>/</i><b>${100-Math.round(leftShare(c))}</b><span>left / right</span></div>
+        <div class="scanBig"><b>${Math.round(topShare(c))}</b><i>/</i><b>${100-Math.round(topShare(c))}</b><span>top / bottom</span></div>
         ${verdictBlock}
         <p class="scanMm">L ${c.leftMm.toFixed(2)} &nbsp; R ${c.rightMm.toFixed(2)} mm<br>
            T ${c.topMm.toFixed(2)} &nbsp; B ${c.bottomMm.toFixed(2)} mm<br>
@@ -2971,7 +3042,7 @@ function runDetect() {
     } else if (weak.length) {
       setFlag('warn',`Check the ${weak.join(' and ')} edge${weak.length>1?'s':''} — the fit there is loose.`);
     } else if (res.sleeve>0.35) {
-      setFlag('warn',`A second edge was found just outside the card on ${Math.round(res.sleeve*100)}% of scan lines — this card may be sleeved.`);
+      setFlag('warn',`A second edge was found just outside the card on ${Math.round(res.sleeve*100)}% of scan lines — a sleeve, a shadow on the mat, or the card's own edge thickness.`);
     } else if (sep!==null && sep<SEP_OK) {
       setFlag('warn','Colours are workable but not generous. More contrast would help.');
     } else setFlag(null);
@@ -4218,8 +4289,8 @@ function measure() {
   state.frameSkew = (lrMm>0.2&&tbMm>0.2) ? Math.max(lrMm,tbMm)/Math.min(lrMm,tbMm) : 1;
   state.frameMm = { lr:lrMm, tb:tbMm };
   const hPct=ratio(left,right), vPct=ratio(top,bottom);
-  show('hRatio',hPct,left<=right?'left tight':'right tight');
-  show('vRatio',vPct,top<=bottom?'top tight':'bottom tight');
+  show('hRatio',share(left,right),left<=right?'left tight':'right tight');
+  show('vRatio',share(top,bottom),top<=bottom?'top tight':'bottom tight');
   const mm=v=>(v*f.mmPerPx).toFixed(2);
   document.getElementById('gaps').innerHTML=
     `L <b>${mm(left)}</b> mm &nbsp; R <b>${mm(right)}</b> mm<br>`+
@@ -4234,7 +4305,26 @@ function measure() {
   renderConcerns();
 }
 
+// The grade depends on the WORST side, so this deliberately takes the larger of
+// the two shares and throws the direction away. Correct for grading, wrong for
+// display - see share() below.
 function ratio(a,b){ const t=a+b; if(t<=0||a<0||b<0) return null; return Math.max(a,b)/t*100; }
+
+// The share of the total belonging to the FIRST argument, direction intact.
+// Anything labelled "left / right" or "top / bottom" must use this, or a card
+// tight on the right reads as though it were tight on the left.
+function share(a,b){ const t=a+b; if(t<=0||a<0||b<0) return null; return a/t*100; }
+
+// Records saved before v43 carry no stored direction, but leftMm/rightMm were
+// always written, so the direction can be recovered from those instead.
+function leftShare(c){
+  if (c.leftPct!==undefined && c.leftPct!==null) return c.leftPct;
+  return share(c.leftMm, c.rightMm);
+}
+function topShare(c){
+  if (c.topPct!==undefined && c.topPct!==null) return c.topPct;
+  return share(c.topMm, c.bottomMm);
+}
 
 function show(id,pct,note) {
   const el=document.getElementById(id);
