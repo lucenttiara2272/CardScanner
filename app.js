@@ -5,7 +5,7 @@
    this file, so this is the only thing to replace when updating.
    =========================================================================== */
 
-const VERSION = 'v45';
+const VERSION = 'v47';
 
 (function boot() {
 
@@ -390,6 +390,23 @@ const CSS = String.raw`
   .ownedMeta em, .ownedMeta i { font-style:normal; font-size:11px; color:var(--ink-dim); }
   .ownedQty { display:flex; align-items:center; gap:8px; flex:none; }
   .ownedQty b { font-family:"IBM Plex Mono",monospace; font-size:15px; min-width:22px; text-align:center; }
+
+  .deckWrap { display:flex; flex-direction:column; gap:8px; }
+  .deckH { margin:12px 0 2px; font-family:"Archivo",sans-serif; font-size:11px;
+           letter-spacing:0.12em; text-transform:uppercase; color:var(--ink-dim); }
+  .deckRow { display:flex; align-items:baseline; gap:10px; padding:7px 9px;
+             border-radius:5px; border:1px solid var(--line); background:var(--panel); }
+  .deckRow[data-need="1"] { border-style:dashed; }
+  .deckRow b { font-family:"IBM Plex Mono",monospace; font-size:14px; min-width:20px; }
+  .deckName { flex:1; min-width:0; font-size:13px; }
+  .deckName em { font-style:normal; display:block; font-size:10px; color:var(--ink-dim); }
+  .deckTag { font-size:10px; color:var(--ink-dim); white-space:nowrap; }
+  .deckRow[data-need="1"] .deckTag { color:var(--warn,#e0a35c); }
+  .deckCost { margin:0; font-size:12px; color:var(--ink-dim); }
+
+  .autoLine { margin:0; font-size:11px; line-height:1.6; color:var(--ink-dim); }
+  .autoWarn { color:var(--warn,#e5a33c); }
+  .rvRow { width:100%; text-align:left; cursor:pointer; color:var(--ink); }
   .scanNums[data-doubt="1"] .scanWarn { color:var(--fail); border-left-color:var(--fail); }
 
   @media (max-width:760px) {
@@ -446,6 +463,8 @@ const MARKUP = String.raw`
   <button class="btn" id="quickBtn" data-on="0">Quick<span class="wide"> add</span></button>
   <button class="btn" id="batchBtn" data-on="0">Batch</button>
   <button class="btn" id="ownedBtn" data-on="0">Tracked (0)</button>
+  <button class="btn" id="deckBtn" data-on="0">Deck</button>
+  <button class="btn" id="reviewBtn" data-on="0">Review (0)</button>
   <button class="btn" id="collBtn" data-on="0">Collection (0)</button>
   <button class="btn" data-primary id="loadBtn">Load <span class="wide">card </span>photo</button>
   <input type="file" id="file" accept="image/*" hidden>
@@ -506,6 +525,8 @@ const MARKUP = String.raw`
 
 <div class="scanView" id="scan" style="display:none"></div>
 <div class="ownedView" id="owned" style="display:none"></div>
+<div class="ownedView" id="deck" style="display:none"></div>
+<div class="ownedView" id="review" style="display:none"></div>
 
 <footer>
   The background reference for each edge is now found in two passes: a thin outer
@@ -567,8 +588,13 @@ const state = {
   frameSkew:1, frameMm:null, guideConsensus:null, guideBacking:0,
   calibDrift:0, assessment:null, sleeveMode:false,
   view:'gauge', sortKey:'date', sortDir:'desc', openCard:null, focusField:null, lastQuery:null,
-  scan:{ stream:null, running:false, lastCheck:0, quality:null, shot:null, result:null, busy:false, error:null, mode:'grade', lastAdded:null },
+  scan:{ stream:null, running:false, lastCheck:0, quality:null, shot:null, result:null, busy:false, error:null,
+        mode:'grade', lastAdded:null, lastReview:null,
+        autoCapture:false, autoId:false, armed:true, goodRun:0, clearRun:0,
+        autoStats:{ added:0, review:0 } },
   batch:null, batchCalib:null,
+  deck:null,
+  review:{ open:null, hits:null, query:null, msg:null, searching:false },
   quad:null, corners:null, cornerRef:null, cornerPxPerMm:null, cornerNative:null,
   edgeScan:null, edgeMark:null, edgeDepth:EDGE_DEPTH_DEFAULT,
   borderRef:null, borderH:null, borderSrc:null,
@@ -2020,6 +2046,7 @@ function renderQuickAdd(host, r) {
         </button>`).join('')}</div>`;
 
   host.innerHTML=`<div class="scanDone qaWrap">
+    ${r.autoBusy?`<p class="qaOk">${qaEsc(r.autoMsg||'Working…')}</p>`:''}
     ${sc.lastAdded?`<p class="qaOk">Added ${qaEsc(sc.lastAdded)} &middot; ${ownedCount()} tracked</p>`:''}
     <div class="scanCard"><img src="${r.thumb}" alt=""></div>
     ${r.numStrip?`<div class="strip2">
@@ -2098,6 +2125,644 @@ function renderOwned() {
   if (ex) ex.onclick=ownedExport;
   host.querySelectorAll('[data-more]').forEach(b=>b.onclick=()=>{ ownedAdjust(b.dataset.more,1); renderOwned(); });
   host.querySelectorAll('[data-less]').forEach(b=>b.onclick=()=>{ ownedAdjust(b.dataset.less,-1); renderOwned(); });
+}
+
+// ===========================================================================
+// AUTO SCAN  (hands-free capture, number OCR, review queue)
+// ===========================================================================
+//
+// Two independent halves, so one failing does not take the other down:
+//   - Auto capture fires the shutter once framing has been good for a moment.
+//   - Auto identify reads the collector number and looks the card up.
+//
+// If identification is unavailable or unsure, the card is still captured and
+// parked in the review queue. A wrong card quietly entering the collection is
+// much worse than a card waiting to be named, so the bar for adding without
+// asking is deliberately high and anything short of certain gets referred.
+// ===========================================================================
+
+const REVIEW_KEY='centeringGauge.review.v1';
+const AUTO_GOOD_FRAMES  = 4;    // ~0.9s of steady good framing before firing
+const AUTO_CLEAR_FRAMES = 2;    // the card must leave the frame before re-arming
+const OCR_MIN_CONF      = 60;   // Tesseract's own confidence, 0-100
+const REVIEW_MAX        = 200;
+
+function loadReview() {
+  if (!storeAvailable()) return { items:[] };
+  try { const raw=localStorage.getItem(REVIEW_KEY);
+        return raw ? { items:(JSON.parse(raw).items||[]) } : { items:[] }; }
+  catch(e) { return { items:[] }; }
+}
+function writeReview(st) {
+  if (!storeAvailable()) return { ok:false, error:'No storage available in this browser.' };
+  try { localStorage.setItem(REVIEW_KEY, JSON.stringify(st)); return { ok:true }; }
+  catch(e) { return { ok:false, error:'Storage is full — clear the review queue, or export and prune.' }; }
+}
+const reviewCount = () => loadReview().items.length;
+
+function reviewAdd(item) {
+  const st=loadReview();
+  if (st.items.length>=REVIEW_MAX)
+    return { ok:false, error:`Review queue is full (${REVIEW_MAX}). Work through it before scanning more.` };
+  st.items.unshift({ id:'r'+Date.now()+Math.random().toString(36).slice(2,6),
+                     at:new Date().toISOString(), ...item });
+  return writeReview(st);
+}
+function reviewRemove(id) {
+  const st=loadReview();
+  st.items=st.items.filter(i=>i.id!==id);
+  writeReview(st);
+}
+
+// Narrower than the grading strip: this is queue storage, and localStorage fills
+// up quickly at full card width.
+function makeReviewStrip(flat, w) {
+  const pxPerMm=1/flat.mmPerPx;
+  const bandPx=Math.max(1, Math.round(8*pxPerMm));
+  const y0=Math.max(0, flat.h-bandPx);
+  const sc=w/flat.w;
+  const c=document.createElement('canvas');
+  c.width=Math.round(w); c.height=Math.max(1,Math.round(bandPx*sc));
+  c.getContext('2d').drawImage(flat.canvas, 0,y0, flat.w,bandPx, 0,0, c.width,c.height);
+  return c.toDataURL('image/jpeg',0.7);
+}
+
+// ---- OCR ----
+
+let ocrWorker=null, ocrState='idle';   // idle | loading | ready | failed
+
+function loadScript(src) {
+  return new Promise((res,rej)=>{
+    const s=document.createElement('script');
+    s.src=src; s.onload=()=>res(); s.onerror=()=>rej(new Error('script blocked or offline'));
+    document.head.appendChild(s);
+  });
+}
+
+// Loaded only when auto identify is switched on, never at startup. The language
+// model is a one-time download of a few megabytes which the browser then caches.
+async function ocrReady() {
+  if (ocrState==='ready')  return true;
+  if (ocrState==='failed') return false;
+  if (ocrState==='loading') {
+    while (ocrState==='loading') await new Promise(r=>setTimeout(r,150));
+    return ocrState==='ready';
+  }
+  ocrState='loading';
+  try {
+    if (!window.Tesseract)
+      await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js');
+    ocrWorker=await window.Tesseract.createWorker('eng');
+    await ocrWorker.setParameters({
+      // The number is digits and a slash. Narrowing the alphabet is the single
+      // biggest accuracy win available here.
+      tessedit_char_whitelist:'0123456789/ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+      tessedit_pageseg_mode:'7'          // one line of text, not a page
+    });
+    ocrState='ready';
+    console.log('[ocr] ready');
+    return true;
+  } catch(e) {
+    console.log('[ocr] unavailable:', e&&e.message);
+    ocrState='failed';
+    return false;
+  }
+}
+
+// Upscale, desaturate and stretch contrast first. Tesseract reads clean
+// high-contrast text far better than a photograph of printed card stock, and
+// the rectified card gives us a known, repeatable crop to work from.
+function numberCanvas(flat) {
+  const pxPerMm=1/flat.mmPerPx;
+  const bandPx=Math.max(1, Math.round(8*pxPerMm));
+  const y0=Math.max(0, flat.h-bandPx);
+  const wCrop=Math.max(1, Math.round(flat.w*0.62));   // the number sits left of centre
+  const up=Math.max(1, Math.min(4, 900/wCrop));
+  const c=document.createElement('canvas');
+  c.width=Math.round(wCrop*up); c.height=Math.round(bandPx*up);
+  const cx=c.getContext('2d',{willReadFrequently:true});
+  cx.imageSmoothingQuality='high';
+  cx.drawImage(flat.canvas, 0,y0, wCrop,bandPx, 0,0, c.width,c.height);
+
+  const d=cx.getImageData(0,0,c.width,c.height), px=d.data;
+  let lo=255, hi=0;
+  for (let i=0;i<px.length;i+=4) {
+    const g=(px[i]*0.299+px[i+1]*0.587+px[i+2]*0.114)|0;
+    px[i]=px[i+1]=px[i+2]=g;
+    if (g<lo) lo=g;
+    if (g>hi) hi=g;
+  }
+  const span=Math.max(1,hi-lo);
+  for (let i=0;i<px.length;i+=4) {
+    const g=Math.max(0,Math.min(255,((px[i]-lo)*255/span)|0));
+    px[i]=px[i+1]=px[i+2]=g;
+  }
+  cx.putImageData(d,0,0);
+  return c;
+}
+
+// "097/084" is the target. Promo codes are a fallback.
+function parseNumber(text) {
+  const t=(text||'').replace(/\s+/g,' ').toUpperCase();
+  const m=t.match(/(\d{1,3})\s*\/\s*(\d{1,3})/);
+  if (m) return { query:`${m[1]}/${m[2]}`, number:parseInt(m[1],10), total:parseInt(m[2],10) };
+  const p=t.match(/\b([A-Z]{2,4}\s?\d{2,3})\b/);
+  if (p) return { query:p[1].replace(/\s/g,''), number:null, total:null };
+  return null;
+}
+
+async function readCardNumber(flat) {
+  if (!(await ocrReady())) return { ok:false, why:'number reading is unavailable here' };
+  try {
+    const r=await ocrWorker.recognize(numberCanvas(flat));
+    const text=(r&&r.data&&r.data.text)||'';
+    const conf=(r&&r.data&&r.data.confidence)||0;
+    const parsed=parseNumber(text);
+    console.log(`[ocr] "${text.trim().replace(/\n/g,' ')}" conf=${Math.round(conf)}`);
+    return { ok:!!parsed, text:text.trim(), conf, parsed, why:parsed?null:'no number found on the card' };
+  } catch(e) {
+    return { ok:false, why:'number reading failed' };
+  }
+}
+
+// The bar for adding a card without asking. Everything else goes to review.
+async function autoIdentify(flat) {
+  const read=await readCardNumber(flat);
+  if (!read.ok) return { confident:false, why:read.why||'number not read', read };
+  if (read.conf < OCR_MIN_CONF)
+    return { confident:false, read,
+             why:`read as ${read.parsed.query}, only ${Math.round(read.conf)}% sure` };
+
+  let hits=[];
+  try { hits=await searchCards(read.parsed.query); }
+  catch(e) { return { confident:false, why:'lookup failed', read }; }
+
+  if (!hits.length)  return { confident:false, why:`nothing matched ${read.parsed.query}`, read, hits };
+  // Same number in more than one printing - reverse holos, promos, reprints.
+  // Guessing between them is exactly the mistake worth avoiding.
+  if (hits.length>1) return { confident:false, why:`${hits.length} cards share ${read.parsed.query}`, read, hits };
+  return { confident:true, hit:hits[0], read };
+}
+
+// ---- hands-free capture ----
+
+// Fires once framing has been steadily good, then waits for the card to leave
+// the frame before arming again, so a card left on the mat is not scanned twice.
+function maybeAutoCapture() {
+  const sc=state.scan;
+  if (sc.mode!=='quick' || !sc.autoCapture || sc.busy || sc.result) return;
+
+  const q=sc.quality, vd=scanVerdict(q);
+
+  if (!sc.armed) {
+    if (!q || !q.found) {
+      sc.clearRun=(sc.clearRun||0)+1;
+      if (sc.clearRun>=AUTO_CLEAR_FRAMES) { sc.armed=true; sc.clearRun=0; sc.goodRun=0; }
+    } else sc.clearRun=0;
+    return;
+  }
+
+  // 'good' only. 'soft' framing is fine when a person chose to press the button
+  // and can see what they are photographing; it is not fine unattended.
+  if (vd.level==='good') {
+    sc.goodRun=(sc.goodRun||0)+1;
+    if (sc.goodRun>=AUTO_GOOD_FRAMES) { sc.goodRun=0; sc.armed=false; captureScan(); }
+  } else sc.goodRun=0;
+}
+
+async function quickAuto(flat) {
+  const sc=state.scan;
+  if (!sc.result) return;
+  sc.result.autoBusy=true;
+  sc.result.autoMsg='Reading the number\u2026';
+  renderScan();
+
+  const res=await autoIdentify(flat);
+  if (!sc.result) return;                       // moved on while we were working
+
+  if (res.confident) {
+    const w=ownedAdd(res.hit, sc.result.thumb);
+    if (w.ok) {
+      sc.lastAdded=`${res.hit.name} — ${res.hit.set} ${res.hit.number}`;
+      sc.lastReview=null;
+      sc.autoStats.added++;
+      quickNext();
+      return;
+    }
+    res.why=w.error;
+  }
+
+  const r=reviewAdd({
+    thumb:sc.result.thumb, strip:sc.result.reviewStrip,
+    ocr:res.read?res.read.text:'', conf:res.read?Math.round(res.read.conf||0):0,
+    why:res.why||'uncertain'
+  });
+  if (!r.ok) { sc.result.autoBusy=false; sc.result.autoMsg=r.error; renderScan(); return; }
+
+  sc.autoStats.review++;
+  sc.lastAdded=null;
+  sc.lastReview=res.why||'uncertain';
+  quickNext();
+}
+
+// ---- review queue view ----
+
+function renderReview() {
+  const host=document.getElementById('review');
+  if (!host) return;
+  const st=loadReview();
+  const open=state.review&&state.review.open;
+
+  if (!st.items.length) {
+    host.innerHTML=`<div class="ownedWrap"><p class="ownedEmpty">Nothing waiting. Cards land here when auto scan captures one but cannot be sure what it is.</p></div>`;
+    return;
+  }
+
+  if (open) {
+    const it=st.items.find(i=>i.id===open);
+    if (!it) { state.review.open=null; renderReview(); return; }
+    const rv=state.review;
+    const list = !rv.hits ? '' : !rv.hits.length ? '' :
+      `<div class="qaList">${rv.hits.map((h,i)=>`
+        <button class="qaHit" data-i="${i}">
+          ${h.thumb?`<img src="${h.thumb}" alt="">`:'<span class="qaNoImg"></span>'}
+          <span class="qaMeta"><b>${qaEsc(h.name)}</b>
+            <em>${qaEsc(h.set)} &middot; ${qaEsc(h.number)}${h.rarity?' &middot; '+qaEsc(h.rarity):''}</em>
+          </span>
+        </button>`).join('')}</div>`;
+
+    host.innerHTML=`<div class="ownedWrap">
+      <button class="btn" id="rvBack">&larr; Back to queue (${st.items.length})</button>
+      <div class="scanCard"><img src="${it.thumb}" alt=""></div>
+      ${it.strip?`<div class="strip2"><div class="win"><img src="${it.strip}" alt="bottom of card"></div>
+        <span>${qaEsc(it.why||'')}${it.ocr?` &middot; read as “${qaEsc(it.ocr.replace(/\n/g,' '))}” (${it.conf}%)`:''}</span></div>`:''}
+      <div class="qaSearch">
+        <input id="rvQ" type="search" inputmode="search" autocomplete="off"
+               placeholder="Number or name" value="${qaEsc(rv.query!=null?rv.query:(it.ocr||'').match(/\d{1,3}\s*\/\s*\d{1,3}/)?(it.ocr.match(/\d{1,3}\s*\/\s*\d{1,3}/)[0].replace(/\s/g,'')):'')}">
+        <button class="btn" data-primary id="rvGo">${rv.searching?'Searching…':'Find'}</button>
+      </div>
+      ${rv.msg?`<p class="scanWarn">${qaEsc(rv.msg)}</p>`:''}
+      ${list}
+      <button class="btn" id="rvDrop">Discard this card</button>
+    </div>`;
+
+    document.getElementById('rvBack').onclick=()=>{ state.review={open:null}; renderReview(); };
+    const q=document.getElementById('rvQ');
+    if (q) q.onkeydown=e=>{ if (e.key==='Enter') { e.preventDefault(); reviewSearch(); } };
+    document.getElementById('rvGo').onclick=reviewSearch;
+    document.getElementById('rvDrop').onclick=()=>{ reviewRemove(it.id); state.review={open:null}; renderReview(); setView('review'); };
+    host.querySelectorAll('.qaHit').forEach(b=>b.onclick=()=>{
+      const hit=rv.hits[+b.dataset.i];
+      const w=ownedAdd(hit, it.thumb);
+      if (!w.ok) { state.review.msg=w.error; renderReview(); return; }
+      reviewRemove(it.id);
+      state.review={open:null};
+      renderReview();
+      setView('review');
+    });
+    return;
+  }
+
+  host.innerHTML=`<div class="ownedWrap">
+    <div class="ownedHead"><span><b>${st.items.length}</b> waiting to be named</span></div>
+    <div class="ownedList">${st.items.map(it=>`
+      <button class="ownedRow rvRow" data-open="${it.id}">
+        ${it.thumb?`<img src="${it.thumb}" alt="">`:'<span class="qaNoImg"></span>'}
+        <span class="ownedMeta">
+          <b>${qaEsc(it.ocr?it.ocr.replace(/\n/g,' ').slice(0,28):'unread')}</b>
+          <em>${qaEsc(it.why||'')}</em>
+        </span>
+      </button>`).join('')}</div>
+  </div>`;
+  host.querySelectorAll('[data-open]').forEach(b=>b.onclick=()=>{
+    state.review={ open:b.dataset.open, hits:null, query:null, msg:null, searching:false };
+    renderReview();
+  });
+}
+
+async function reviewSearch() {
+  const rv=state.review;
+  const box=document.getElementById('rvQ');
+  const text=(box?box.value:'').trim();
+  if (!text) return;
+  rv.query=text; rv.searching=true; rv.msg=null; rv.hits=null;
+  renderReview();
+  try {
+    rv.hits=await searchCards(text);
+    if (!rv.hits.length) rv.msg='Nothing matched that.';
+  } catch(e) { rv.hits=[]; rv.msg=e.message||'Lookup failed.'; }
+  rv.searching=false;
+  renderReview();
+}
+
+// ===========================================================================
+// DECK BUILDER  (Standard)
+// ===========================================================================
+//
+// What this can and cannot do, stated plainly because the output will be read as
+// more than it is: it guarantees a LEGAL deck - sixty cards, at most four of any
+// name, at least one Basic, complete evolution lines, energy that matches what
+// the attackers actually cost. It does not know what is GOOD. No free API
+// publishes tournament results, so nothing here is metagame-aware.
+// ===========================================================================
+
+// 2026-27 season. Rotation happens every April, so this needs a yearly edit -
+// though legalities.standard from the API is preferred wherever it is present,
+// and that tracks rotation on its own.
+const STANDARD_MARKS = ['H','I','J'];
+
+const DECK_SIZE = 60;
+const MAX_COPIES = 4;
+const TARGET_POKEMON = 14;
+const TARGET_ENERGY = 11;
+
+// Candidate staples, not gospel. Every name here is checked against the API
+// before it is suggested, so anything that has rotated out quietly drops off the
+// list instead of producing an illegal decklist. Edit freely.
+const STAPLE_NAMES = [
+  "Professor's Research", "Boss's Orders", "Iono", "Arven",
+  "Ultra Ball", "Nest Ball", "Buddy-Buddy Poffin", "Rare Candy",
+  "Switch", "Earthen Vessel", "Night Stretcher", "Super Rod",
+  "Counter Catcher", "Pokégear 3.0"
+];
+
+// The API's own verdict first: it tracks bans as well as rotation, which a
+// regulation mark cannot. The mark is the fallback for records saved before
+// legalities were captured.
+function standardLegal(c) {
+  const L=c.legalities;
+  if (L && L.standard) return L.standard==='Legal';
+  if (c.regMark) return STANDARD_MARKS.indexOf(c.regMark)>=0;
+  return false;
+}
+
+// A card with an old mark is still legal if some printing of the same name is
+// legal now - an unmarked Rare Candy is playable because a current one exists.
+// Checking that costs an API call per name, so results are cached for the run.
+const nameLegalCache = new Map();
+async function nameHasLegalPrint(name) {
+  if (nameLegalCache.has(name)) return nameLegalCache.get(name);
+  let out=null;
+  try {
+    const raw=await apiGet(`name:"${name.replace(/["\\]/g,'')}"`, 60);
+    const legal=raw.map(mapCard).filter(standardLegal);
+    if (legal.length) {
+      legal.sort((a,b)=>((a.price&&a.price.value)||1e9)-((b.price&&b.price.value)||1e9));
+      out=legal[0];
+    }
+  } catch(e) { out=null; }
+  nameLegalCache.set(name,out);
+  return out;
+}
+
+// Every owned copy, from both stores, as a flat list of {name, card, qty}.
+function deckPool() {
+  const by=new Map();
+  const add=(c,qty)=>{
+    if (!c||!c.name) return;
+    const k=c.name;
+    const cur=by.get(k);
+    if (cur) { cur.qty+=qty; if (!cur.card.supertype && c.supertype) cur.card=c; }
+    else by.set(k,{ name:k, card:c, qty });
+  };
+  for (const r of loadOwned().cards) add(r, r.qty||1);
+  for (const r of loadStore().cards) if (r.card && r.card.name) add(r.card, 1);
+  return [...by.values()];
+}
+
+const isPokemon = c => (c.supertype||'')==='Pokémon' || (c.supertype||'')==='Pokemon';
+const isTrainer = c => (c.supertype||'')==='Trainer';
+const isEnergy  = c => (c.supertype||'')==='Energy';
+const isBasicMon = c => isPokemon(c) && (c.subtypes||[]).indexOf('Basic')>=0;
+const stageOf = c => (c.subtypes||[]).indexOf('Stage 2')>=0 ? 2
+                   : (c.subtypes||[]).indexOf('Stage 1')>=0 ? 1 : 0;
+
+// Energy an attacker actually needs, ignoring Colorless - Colorless is paid by
+// anything, so it never determines which basic Energy goes in the deck.
+function energyNeeds(c) {
+  const out=new Set();
+  for (const cost of (c.attackCost||[]))
+    for (const e of cost) if (e && e!=='Colorless') out.add(e);
+  if (!out.size) for (const t of (c.types||[])) if (t!=='Colorless') out.add(t);
+  return [...out];
+}
+
+// Prefer something that can win a game and does not need a whole evolution line
+// dragged in behind it. Not a metagame judgement - just fewer moving parts.
+function scoreAttacker(e) {
+  const c=e.card;
+  if (!isPokemon(c) || !(c.attackCost||[]).length) return -1;
+  let s=(c.hp||0);
+  s -= stageOf(c)*40;                        // each stage is another card to find
+  if ((c.subtypes||[]).some(t=>/ex|EX|V|VMAX|VSTAR/.test(t))) s+=60;
+  s += Math.min(e.qty,4)*15;                 // copies you actually hold
+  return s;
+}
+
+async function buildDeck(onProgress) {
+  const pool=deckPool();
+  if (!pool.length) return { error:'Nothing in the collection yet. Quick add some cards first.' };
+
+  // Split into what is legal now and what is not, honouring the reprint rule.
+  const legal=[], rotated=[];
+  for (const e of pool) {
+    if (standardLegal(e.card)) { legal.push(e); continue; }
+    if (onProgress) onProgress(`checking ${e.name}`);
+    const alt=await nameHasLegalPrint(e.name);
+    if (alt) { e.card={ ...e.card, ...alt }; e.viaReprint=true; legal.push(e); }
+    else rotated.push(e);
+  }
+
+  const mons=legal.filter(e=>isPokemon(e.card)).sort((a,b)=>scoreAttacker(b)-scoreAttacker(a));
+  if (!mons.length)
+    return { error:'No Standard-legal Pokémon in the collection. A deck needs at least one Basic Pokémon.',
+             rotated };
+
+  const attacker=mons[0];
+  const needs=energyNeeds(attacker.card);
+  const deck=[];   // { name, count, card, owned, need }
+  const put=(name,count,card,ownedQty)=>{
+    const owned=Math.min(count, ownedQty||0);
+    deck.push({ name, count, card, owned, need:count-owned });
+  };
+
+  // --- Pokémon ---
+  const stage=stageOf(attacker.card);
+  put(attacker.name, Math.min(MAX_COPIES, stage===0?4:3), attacker.card, attacker.qty);
+
+  // Pull in whatever the attacker evolves from, walking the chain back.
+  let from=attacker.card.evolvesFrom;
+  let guard=0;
+  while (from && guard++<3) {
+    const owned=legal.find(e=>e.name===from);
+    const card=owned ? owned.card : await nameHasLegalPrint(from);
+    if (!card) { deck.push({ name:from, count:4, card:null, owned:0, need:4, missing:true }); break; }
+    put(from, 4, card, owned?owned.qty:0);
+    from=card.evolvesFrom;
+  }
+
+  // Top up with other Basics, cheapest commitment first.
+  let monCount=deck.reduce((n,d)=>n+d.count,0);
+  for (const e of legal.filter(e=>isBasicMon(e.card) && !deck.some(d=>d.name===e.name))) {
+    if (monCount>=TARGET_POKEMON) break;
+    const n=Math.min(MAX_COPIES, e.qty, TARGET_POKEMON-monCount);
+    if (n<=0) continue;
+    put(e.name, n, e.card, e.qty);
+    monCount+=n;
+  }
+
+  // --- Energy ---
+  const energyTypes = needs.length?needs:['Colorless'];
+  const perType=Math.max(4, Math.floor(TARGET_ENERGY/energyTypes.length));
+  const energy=[];
+  for (const t of energyTypes) {
+    const owned=legal.find(e=>isEnergy(e.card) && e.name.indexOf(t)>=0);
+    // Basic Energy has no name limit, and is the cheapest thing in the game.
+    energy.push({ name:`Basic ${t} Energy`, count:perType, card:owned?owned.card:null,
+                  owned:owned?Math.min(perType,owned.qty):0,
+                  need:perType-(owned?Math.min(perType,owned.qty):0), basicEnergy:true });
+  }
+  const energyCount=energy.reduce((n,d)=>n+d.count,0);
+
+  // --- Trainers fill whatever is left ---
+  let room=DECK_SIZE-monCount-energyCount;
+  const trainers=[];
+  for (const e of legal.filter(e=>isTrainer(e.card))) {
+    if (room<=0) break;
+    const n=Math.min(MAX_COPIES, e.qty, room);
+    if (n<=0) continue;
+    trainers.push({ name:e.name, count:n, card:e.card, owned:n, need:0 });
+    room-=n;
+  }
+
+  // Then the shopping list, only for names the API confirms are legal today.
+  const shortfall=[];
+  for (const nm of STAPLE_NAMES) {
+    if (room<=0) break;
+    if (trainers.some(t=>t.name===nm)) continue;
+    if (onProgress) onProgress(`checking ${nm}`);
+    const card=await nameHasLegalPrint(nm);
+    if (!card) continue;
+    const n=Math.min(MAX_COPIES, room);
+    shortfall.push({ name:nm, count:n, card, owned:0, need:n });
+    room-=n;
+  }
+
+  const all=[...deck, ...trainers, ...shortfall, ...energy];
+
+  // If staples ran out before 60, say so rather than padding with filler.
+  const total=all.reduce((n,d)=>n+d.count,0);
+  const cost=all.reduce((s,d)=>s+d.need*((d.card&&d.card.price&&d.card.price.value)||0),0);
+  const cur=(all.find(d=>d.card&&d.card.price)||{card:{}}).card.price;
+
+  return {
+    attacker:attacker.name, energyTypes, rows:all, total,
+    short: DECK_SIZE-total,
+    buyCost:cost, buyCurrency:cur?cur.currency:'',
+    rotated,
+    legalityNotes: checkLegal(all)
+  };
+}
+
+// The rules a decklist has to satisfy, checked rather than assumed.
+function checkLegal(rows) {
+  const out=[];
+  const total=rows.reduce((n,d)=>n+d.count,0);
+  if (total!==DECK_SIZE) out.push(`${total} cards, not ${DECK_SIZE}`);
+  for (const d of rows)
+    if (!d.basicEnergy && d.count>MAX_COPIES) out.push(`${d.count} copies of ${d.name} — the limit is ${MAX_COPIES}`);
+  if (!rows.some(d=>d.card && isBasicMon(d.card))) out.push('no Basic Pokémon — the deck cannot start');
+  return out;
+}
+
+// Standard decklist text, the format PTCGL and tournament sheets expect.
+function deckAsText(res) {
+  const grp=k=>res.rows.filter(k);
+  const line=d=>`${d.count} ${d.name}${d.card&&d.card.setId?' '+d.card.setId.toUpperCase()+' '+String(d.card.number).split('/')[0]:''}`;
+  const mon=grp(d=>d.card&&isPokemon(d.card)||d.missing);
+  const tr=grp(d=>d.card&&isTrainer(d.card));
+  const en=grp(d=>d.basicEnergy||(d.card&&isEnergy(d.card)));
+  const n=a=>a.reduce((s,d)=>s+d.count,0);
+  return `Pokémon: ${n(mon)}\n${mon.map(line).join('\n')}\n\n`
+       + `Trainer: ${n(tr)}\n${tr.map(line).join('\n')}\n\n`
+       + `Energy: ${n(en)}\n${en.map(line).join('\n')}\n`;
+}
+
+function renderDeck() {
+  const host=document.getElementById('deck');
+  if (!host) return;
+  const s=state.deck||{};
+
+  if (s.busy) {
+    host.innerHTML=`<div class="deckWrap"><p class="ownedEmpty">Building… ${qaEsc(s.step||'')}</p></div>`;
+    return;
+  }
+  if (!s.result) {
+    host.innerHTML=`<div class="deckWrap">
+      <p class="ownedEmpty">Builds a legal 60-card Standard deck from what you own, and names what you would need to buy to finish it.
+      Legality is checked against the card database, not guessed — but nothing here knows what is <b>good</b>, only what is <b>allowed</b>.</p>
+      <button class="btn" data-primary id="deckGo">Build a deck</button>
+    </div>`;
+    const g=document.getElementById('deckGo');
+    if (g) g.onclick=runDeckBuild;
+    return;
+  }
+
+  const r=s.result;
+  if (r.error) {
+    host.innerHTML=`<div class="deckWrap"><p class="scanWarn">${qaEsc(r.error)}</p>
+      <button class="btn" id="deckGo">Try again</button></div>`;
+    const g=document.getElementById('deckGo'); if (g) g.onclick=runDeckBuild;
+    return;
+  }
+
+  const row=d=>`<div class="deckRow" data-need="${d.need>0?'1':'0'}">
+      <b>${d.count}</b>
+      <span class="deckName">${qaEsc(d.name)}
+        ${d.card&&d.card.set?`<em>${qaEsc(d.card.set)}</em>`:''}</span>
+      <span class="deckTag">${d.need>0
+        ? `buy ${d.need}${d.card&&d.card.price?` · ${(d.card.price.value*d.need).toFixed(2)} ${qaEsc(d.card.price.currency)}`:''}`
+        : 'owned'}</span>
+    </div>`;
+
+  const section=(title,rows)=>rows.length?`<h3 class="deckH">${title} (${rows.reduce((n,d)=>n+d.count,0)})</h3>${rows.map(row).join('')}`:'';
+
+  host.innerHTML=`<div class="deckWrap">
+    <div class="ownedHead">
+      <span>Built around <b>${qaEsc(r.attacker)}</b>${r.energyTypes.length?` · ${qaEsc(r.energyTypes.join(', '))}`:''}</span>
+      <button class="btn" id="deckGo">Rebuild</button>
+    </div>
+    ${r.legalityNotes.length?`<p class="scanWarn">${r.legalityNotes.map(qaEsc).join(' · ')}</p>`:
+      `<p class="qaOk">Legal: ${r.total} cards, no name over ${MAX_COPIES}, evolution lines complete</p>`}
+    ${r.short>0?`<p class="scanWarn">${r.short} slots unfilled — the staples list ran out. Add more names to STAPLE_NAMES, or own more Trainers.</p>`:''}
+    ${r.buyCost>0?`<p class="deckCost">To finish it: about <b>${r.buyCost.toFixed(2)} ${qaEsc(r.buyCurrency)}</b></p>`:''}
+    ${section('Pokémon', r.rows.filter(d=>(d.card&&isPokemon(d.card))||d.missing))}
+    ${section('Trainer', r.rows.filter(d=>d.card&&isTrainer(d.card)))}
+    ${section('Energy',  r.rows.filter(d=>d.basicEnergy||(d.card&&isEnergy(d.card))))}
+    ${r.rotated.length?`<h3 class="deckH">Not Standard legal (${r.rotated.length})</h3>
+      <p class="ownedEmpty">${r.rotated.slice(0,20).map(e=>qaEsc(e.name)).join(', ')}${r.rotated.length>20?'…':''}</p>`:''}
+    <button class="btn" id="deckCopy">Copy decklist</button>
+  </div>`;
+
+  const g=document.getElementById('deckGo'); if (g) g.onclick=runDeckBuild;
+  const cp=document.getElementById('deckCopy');
+  if (cp) cp.onclick=()=>{
+    const txt=deckAsText(r);
+    if (navigator.clipboard) navigator.clipboard.writeText(txt).then(()=>{ cp.textContent='Copied'; setTimeout(()=>cp.textContent='Copy decklist',1500); });
+    else { const t=document.createElement('textarea'); t.value=txt; document.body.appendChild(t); t.select(); document.execCommand('copy'); t.remove(); }
+  };
+}
+
+async function runDeckBuild() {
+  state.deck={ busy:true, step:'', result:null };
+  renderDeck();
+  try {
+    const res=await buildDeck(step=>{ state.deck.step=step; renderDeck(); });
+    state.deck={ busy:false, result:res };
+  } catch(e) {
+    state.deck={ busy:false, result:{ error:e.message||'Deck build failed.' } };
+  }
+  renderDeck();
 }
 
 // ===========================================================================
@@ -2427,6 +3092,14 @@ function setView(v) {
   if (qb) qb.dataset.on = (v==='scan'&&state.scan.mode==='quick')?'1':'0';
   const ob=document.getElementById('ownedBtn');
   if (ob) { ob.innerHTML=`Tracked (${ownedCount()})`; ob.dataset.on = v==='owned'?'1':'0'; }
+  const dk=document.getElementById('deck');
+  if (dk) dk.style.display = v==='deck'?'':'none';
+  const db=document.getElementById('deckBtn');
+  if (db) db.dataset.on = v==='deck'?'1':'0';
+  const rvw=document.getElementById('review');
+  if (rvw) rvw.style.display = v==='review'?'':'none';
+  const rb=document.getElementById('reviewBtn');
+  if (rb) { rb.innerHTML=`Review (${reviewCount()})`; rb.dataset.on = v==='review'?'1':'0'; }
   const bb=document.getElementById('batchBtn');
   if (bb) bb.dataset.on = v==='batch'?'1':'0';
   const sb=document.getElementById('scanBtn');
@@ -2442,6 +3115,8 @@ function setView(v) {
   if (v==='batch') renderBatch();
   if (v==='scan') renderScan();
   if (v==='owned') renderOwned();
+  if (v==='deck') renderDeck();
+  if (v==='review') renderReview();
 }
 
 // ===========================================================================
@@ -3005,6 +3680,7 @@ function scanLoop(ts) {
     scanWork.getContext('2d',{willReadFrequently:true}).drawImage(v,0,0,sw,sh);
     state.scan.quality=quickFrame(scanWork, Math.max(v.videoWidth, v.videoHeight));
     paintVerdict();
+    maybeAutoCapture();
   }
 
   drawScanOverlay(v, ov);
@@ -3138,9 +3814,12 @@ function runScanPipeline(canvas) {
     state.scan.result={
       ok:true, quick:true,
       thumb:makeThumb(flat,150), numStrip:makeNumberStrip(flat),
-      hits:null, query:'', searching:false, msg:null
+      reviewStrip:makeReviewStrip(flat,600),
+      hits:null, query:'', searching:false, msg:null,
+      autoBusy:false, autoMsg:null
     };
     renderScan();
+    if (state.scan.autoId) quickAuto(flat);
     return;
   }
 
@@ -3268,15 +3947,36 @@ function renderScan() {
     ${sc.error?`<p class="scanBad">${sc.error}</p>`:''}
     <div class="scanActions">
       <button class="btn" data-primary id="scanShot" data-ready="0">Capture</button>
+      ${sc.mode==='quick'?`<button class="btn" id="scanAuto" data-on="${sc.autoCapture?'1':'0'}">Auto ${sc.autoCapture?'on':'off'}</button>`:''}
       <button class="btn" id="scanStop">Stop camera</button>
       <button class="btn" id="scanRetry" hidden>Retry</button>
     </div>
+    ${sc.mode==='quick'?`<p class="autoLine">
+      ${sc.autoCapture
+        ? `Hands-free: it fires by itself once framing holds green, then waits for you to lift the card away. Added <b>${sc.autoStats.added}</b> &middot; sent to review <b>${sc.autoStats.review}</b>.`
+        : 'Auto is off — press Capture yourself.'}
+      ${sc.lastReview?`<br><span class="autoWarn">Last card went to review: ${qaEsc(sc.lastReview)}</span>`:''}
+    </p>`:''}
     <p class="hint">Line the card up inside the dashed guide. The box turns green when the
     framing is good &mdash; card filling most of the frame, a clear gap all round, phone held
     flat above it.</p>
   </div>`;
 
   document.getElementById('scanShot').onclick=captureScan;
+  const au=document.getElementById('scanAuto');
+  if (au) au.onclick=async ()=>{
+    const sc=state.scan;
+    sc.autoCapture=!sc.autoCapture;
+    sc.autoId=sc.autoCapture;
+    sc.armed=true; sc.goodRun=0; sc.clearRun=0;
+    renderScan();
+    // Warm the reader up now rather than stalling on the first card. If it
+    // cannot load, auto capture still works and everything goes to review.
+    if (sc.autoId && ocrState==='idle') {
+      const ok=await ocrReady();
+      if (!ok) { sc.lastReview='number reading unavailable — cards will go to review'; renderScan(); }
+    }
+  };
   document.getElementById('scanStop').onclick=()=>{ stopScan(); renderScan(); };
   const rt=document.getElementById('scanRetry');
   if (rt) rt.onclick=()=>{ stopScan(); rt.hidden=true; startScan(); };
@@ -3328,6 +4028,8 @@ document.getElementById('quickBtn').onclick=()=>{
   setView(on?'gauge':'scan');
 };
 document.getElementById('ownedBtn').onclick=()=>setView(state.view==='owned'?'gauge':'owned');
+document.getElementById('deckBtn').onclick=()=>setView(state.view==='deck'?'gauge':'deck');
+document.getElementById('reviewBtn').onclick=()=>{ state.review={open:null}; setView(state.view==='review'?'gauge':'review'); };
 document.getElementById('loadBtn').onclick=()=>document.getElementById('file').click();
 
 document.getElementById('file').onchange = e => {
