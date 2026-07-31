@@ -5,7 +5,7 @@
    this file, so this is the only thing to replace when updating.
    =========================================================================== */
 
-const VERSION = 'v44';
+const VERSION = 'v45';
 
 (function boot() {
 
@@ -352,6 +352,44 @@ const CSS = String.raw`
   .scanWarn { font-size:11.5px; line-height:1.5; color:var(--warn); margin:0;
     border-left:2px solid var(--warn); padding-left:10px; }
   .scanNums[data-doubt="1"] .scanBig b { color:var(--ink-dim); }
+
+  /* quick add + tracked collection */
+  .qaWrap { display:flex; flex-direction:column; gap:12px; }
+  .qaOk { margin:0; padding:8px 10px; border-radius:6px; font-size:12px;
+          background:rgba(120,200,140,0.12); color:#9fd8ae; }
+  .qaSearch { display:flex; gap:8px; }
+  .qaSearch input { flex:1; min-width:0; padding:11px 12px; font-size:16px;
+                    border-radius:6px; border:1px solid var(--line);
+                    background:var(--panel); color:var(--ink); }
+  .qaList { display:flex; flex-direction:column; gap:6px; }
+  .qaHit { display:flex; gap:10px; align-items:center; text-align:left; width:100%;
+           padding:8px; border-radius:6px; border:1px solid var(--line);
+           background:var(--panel); color:var(--ink); cursor:pointer; }
+  .qaHit:active { background:var(--panel-2,rgba(255,255,255,0.06)); }
+  .qaHit img { width:44px; border-radius:3px; flex:none; }
+  .qaNoImg { width:44px; height:61px; border-radius:3px; flex:none;
+             background:rgba(255,255,255,0.06); }
+  .qaMeta { display:flex; flex-direction:column; gap:2px; min-width:0; }
+  .qaMeta b { font-size:14px; }
+  .qaMeta em, .qaMeta i { font-style:normal; font-size:11px; color:var(--ink-dim); }
+  .qaFoot { display:flex; gap:8px; }
+  .qaFoot .btn { flex:1; }
+
+  .ownedView { padding:12px; }
+  .ownedWrap { display:flex; flex-direction:column; gap:10px; }
+  .ownedEmpty { color:var(--ink-dim); font-size:13px; line-height:1.6; }
+  .ownedHead { display:flex; align-items:center; justify-content:space-between;
+               gap:10px; font-size:12px; color:var(--ink-dim); }
+  .ownedList { display:flex; flex-direction:column; gap:6px; }
+  .ownedRow { display:flex; gap:10px; align-items:center;
+              padding:8px; border-radius:6px; border:1px solid var(--line);
+              background:var(--panel); }
+  .ownedRow img { width:40px; border-radius:3px; flex:none; }
+  .ownedMeta { display:flex; flex-direction:column; gap:2px; flex:1; min-width:0; }
+  .ownedMeta b { font-size:13px; }
+  .ownedMeta em, .ownedMeta i { font-style:normal; font-size:11px; color:var(--ink-dim); }
+  .ownedQty { display:flex; align-items:center; gap:8px; flex:none; }
+  .ownedQty b { font-family:"IBM Plex Mono",monospace; font-size:15px; min-width:22px; text-align:center; }
   .scanNums[data-doubt="1"] .scanWarn { color:var(--fail); border-left-color:var(--fail); }
 
   @media (max-width:760px) {
@@ -405,7 +443,9 @@ const MARKUP = String.raw`
   <h1>Centering Gauge</h1>
   <span class="ver" id="verBadge"></span>
   <button class="btn" id="scanBtn" data-on="0">Scan</button>
+  <button class="btn" id="quickBtn" data-on="0">Quick<span class="wide"> add</span></button>
   <button class="btn" id="batchBtn" data-on="0">Batch</button>
+  <button class="btn" id="ownedBtn" data-on="0">Tracked (0)</button>
   <button class="btn" id="collBtn" data-on="0">Collection (0)</button>
   <button class="btn" data-primary id="loadBtn">Load <span class="wide">card </span>photo</button>
   <input type="file" id="file" accept="image/*" hidden>
@@ -465,6 +505,7 @@ const MARKUP = String.raw`
 <div class="collection" id="batch" style="display:none"></div>
 
 <div class="scanView" id="scan" style="display:none"></div>
+<div class="ownedView" id="owned" style="display:none"></div>
 
 <footer>
   The background reference for each edge is now found in two passes: a thin outer
@@ -526,7 +567,7 @@ const state = {
   frameSkew:1, frameMm:null, guideConsensus:null, guideBacking:0,
   calibDrift:0, assessment:null, sleeveMode:false,
   view:'gauge', sortKey:'date', sortDir:'desc', openCard:null, focusField:null, lastQuery:null,
-  scan:{ stream:null, running:false, lastCheck:0, quality:null, shot:null, result:null, busy:false, error:null },
+  scan:{ stream:null, running:false, lastCheck:0, quality:null, shot:null, result:null, busy:false, error:null, mode:'grade', lastAdded:null },
   batch:null, batchCalib:null,
   quad:null, corners:null, cornerRef:null, cornerPxPerMm:null, cornerNative:null,
   edgeScan:null, edgeMark:null, edgeDepth:EDGE_DEPTH_DEFAULT,
@@ -1498,7 +1539,9 @@ function buildRecord() {
 
   const rec={
     id:null, savedAt:new Date().toISOString(),
-    card:{ name:'', set:'', number:'', rarity:'', notes:'' },
+    card:{ name:'', set:'', number:'', rarity:'', notes:'',
+           supertype:'', subtypes:[], types:[], evolvesFrom:'', hp:null,
+           retreat:null, attackCost:[], legalities:{}, regMark:'' },
     type:state.cardType, side:state.side,
     centering:{
       leftMm:mm(left), rightMm:mm(right), topMm:mm(top), bottomMm:mm(bottom),
@@ -1697,6 +1740,24 @@ async function apiGet(q, pageSize) {
   return json.data||[];
 }
 
+// Everything a deck list needs and grading does not: what kind of card this is,
+// what it evolves from, what its attacks cost, and which formats it is legal in.
+// Captured at lookup time because fetching it later costs one API call per card
+// and the free tier will not wear that for a large collection.
+function deckFacts(c) {
+  return {
+    supertype:   c.supertype||'',                 // Pokémon | Trainer | Energy
+    subtypes:    c.subtypes||[],                  // Basic, Stage 1, ex, Supporter, Item
+    types:       c.types||[],                     // Fire, Water, ...
+    evolvesFrom: c.evolvesFrom||'',
+    hp:          c.hp?parseInt(c.hp,10):null,
+    retreat:     Array.isArray(c.retreatCost)?c.retreatCost.length:null,
+    attackCost:  (c.attacks||[]).map(a=>a.cost||[]),
+    legalities:  c.legalities||{},                // { standard:'Legal', expanded:'Legal' }
+    regMark:     c.regulationMark||''
+  };
+}
+
 const mapCard=c=>({
   id:c.id, name:c.name,
   set:c.set?c.set.name:'', setId:c.set?c.set.id:'',
@@ -1704,7 +1765,8 @@ const mapCard=c=>({
   number:c.number+(c.set&&c.set.printedTotal?'/'+c.set.printedTotal:''),
   rarity:c.rarity||'',
   thumb:c.images?c.images.small:null,
-  price:bestPrice(c)
+  price:bestPrice(c),
+  ...deckFacts(c)
 });
 
 async function searchCards(text) {
@@ -1755,6 +1817,13 @@ function attachCard(recId, hit) {
   rec.card.set=hit.set;
   rec.card.number=hit.number;
   rec.card.rarity=hit.rarity;
+  // Deck facts ride along, so a graded card can still be counted in a deck later
+  // without a second trip to the API.
+  Object.assign(rec.card, {
+    supertype:hit.supertype||'', subtypes:hit.subtypes||[], types:hit.types||[],
+    evolvesFrom:hit.evolvesFrom||'', hp:hit.hp??null, retreat:hit.retreat??null,
+    attackCost:hit.attackCost||[], legalities:hit.legalities||{}, regMark:hit.regMark||''
+  });
   rec.market = hit.price
     ? { ...hit.price, at:new Date().toISOString(), apiId:hit.id }
     : { none:true, at:new Date().toISOString(), apiId:hit.id };
@@ -1795,6 +1864,241 @@ const money=m=>{
   const sym=m.currency==='EUR'?'\u20ac':m.currency==='USD'?'$':'';
   return sym+m.value.toFixed(2);
 };
+
+// ===========================================================================
+// OWNED COPIES  (collection tracking, no grading)
+// ===========================================================================
+//
+// Deliberately a separate store from the graded records. A graded record is one
+// physical copy with measurements attached; an owned entry is "I have four of
+// these". Mixing them would mean either faking centering data on cards that were
+// never measured, or guarding every graded read against nulls - and the list,
+// sort and compare views all reach straight into r.centering.worst today.
+// ===========================================================================
+
+const OWNED_KEY='centeringGauge.owned.v1';
+
+function loadOwned() {
+  if (!storeAvailable()) return { cards:[] };
+  try {
+    const raw=localStorage.getItem(OWNED_KEY);
+    if (!raw) return { cards:[] };
+    const o=JSON.parse(raw);
+    return { cards:o.cards||[] };
+  } catch(e) { return { cards:[] }; }
+}
+
+function writeOwned(st) {
+  if (!storeAvailable()) return { ok:false, error:'No storage available in this browser.' };
+  try { localStorage.setItem(OWNED_KEY, JSON.stringify(st)); return { ok:true }; }
+  catch(e) { return { ok:false, error:'Storage is full. Export the collection, then remove some records.' }; }
+}
+
+const ownedCount = () => loadOwned().cards.reduce((n,c)=>n+(c.qty||1),0);
+
+// A duplicate raises the count rather than adding a second row. Which printing
+// it is still matters, so the key is the API id, not the card name: a Charizard
+// from two sets is two entries, four of one printing is one entry of four.
+function ownedAdd(hit, thumb) {
+  const st=loadOwned();
+  const found=st.cards.find(c=>c.apiId===hit.id);
+  if (found) {
+    found.qty=(found.qty||1)+1;
+    found.seenAt=new Date().toISOString();
+    if (!found.thumb && thumb) found.thumb=thumb;
+  } else {
+    st.cards.unshift({
+      apiId:hit.id, qty:1,
+      addedAt:new Date().toISOString(), seenAt:new Date().toISOString(),
+      name:hit.name, set:hit.set, setId:hit.setId, number:hit.number, rarity:hit.rarity,
+      thumb:thumb||hit.thumb||null,
+      price:hit.price||null,
+      supertype:hit.supertype||'', subtypes:hit.subtypes||[], types:hit.types||[],
+      evolvesFrom:hit.evolvesFrom||'', hp:hit.hp??null, retreat:hit.retreat??null,
+      attackCost:hit.attackCost||[], legalities:hit.legalities||{}, regMark:hit.regMark||''
+    });
+  }
+  return writeOwned(st);
+}
+
+function ownedAdjust(apiId, delta) {
+  const st=loadOwned();
+  const i=st.cards.findIndex(c=>c.apiId===apiId);
+  if (i<0) return;
+  st.cards[i].qty=(st.cards[i].qty||1)+delta;
+  if (st.cards[i].qty<=0) st.cards.splice(i,1);
+  writeOwned(st);
+}
+
+function ownedExport() {
+  const blob=new Blob([JSON.stringify(loadOwned(),null,2)],{type:'application/json'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=`owned-${new Date().toISOString().slice(0,10)}.json`;
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+}
+
+// Records saved before deck facts existed have a name and an apiId but nothing a
+// deck can be built from. This refills them one at a time, slowly enough not to
+// trip the rate limit, and reports progress rather than freezing the page.
+async function enrichGraded(onProgress) {
+  const st=loadStore();
+  const todo=st.cards.filter(r=>r.apiId && r.card && !r.card.supertype);
+  if (!todo.length) return { done:0, failed:0, total:0 };
+  const headers={}; const k=apiKey(); if (k) headers['X-Api-Key']=k;
+  let done=0, failed=0;
+  for (const rec of todo) {
+    try {
+      const res=await fetch(`${API_BASE}/cards/${encodeURIComponent(rec.apiId)}`,{ headers });
+      if (res.ok) {
+        const c=(await res.json()).data;
+        if (c) { Object.assign(rec.card, deckFacts(c)); done++; } else failed++;
+      } else failed++;
+    } catch(e) { failed++; }
+    if (onProgress) onProgress(done+failed, todo.length);
+    // The free tier is tight without a key; a short gap costs little next to
+    // losing the whole run to a 429 halfway through.
+    await new Promise(r=>setTimeout(r, k?120:420));
+  }
+  writeStore(st);
+  return { done, failed, total:todo.length };
+}
+
+const qaEsc = s => String(s==null?'':s)
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+async function quickSearch() {
+  const sc=state.scan, r=sc.result;
+  if (!r||!r.quick) return;
+  const box=document.getElementById('qaQ');
+  const text=(box?box.value:'').trim();
+  if (!text) return;
+  r.query=text; r.searching=true; r.msg=null; r.hits=null;
+  renderScan();
+  try {
+    r.hits=await searchCards(text);
+    if (!r.hits.length) r.msg='Nothing matched. Try the number on its own, or fewer words of the name.';
+  } catch(e) {
+    r.hits=[]; r.msg=e.message||'Lookup failed.';
+  }
+  r.searching=false;
+  renderScan();
+}
+
+function quickPick(i) {
+  const r=state.scan.result;
+  if (!r||!r.hits||!r.hits[i]) return;
+  const hit=r.hits[i];
+  const w=ownedAdd(hit, r.thumb);
+  if (!w.ok) { r.msg=w.error; renderScan(); return; }
+  state.scan.lastAdded=`${hit.name} — ${hit.set} ${hit.number}`;
+  quickNext();
+}
+
+// Straight back to the camera. The point of this mode is the next card, not a
+// confirmation screen between every one.
+function quickNext() {
+  const sc=state.scan;
+  sc.result=null; sc.shot=null; sc.busy=false;
+  renderScan();
+  if (cameraPossible()) startScan();
+}
+
+function renderQuickAdd(host, r) {
+  const sc=state.scan;
+  const list = r.hits===null ? ''
+    : !r.hits.length ? ''
+    : `<div class="qaList">${r.hits.map((h,i)=>`
+        <button class="qaHit" data-i="${i}">
+          ${h.thumb?`<img src="${h.thumb}" alt="">`:'<span class="qaNoImg"></span>'}
+          <span class="qaMeta">
+            <b>${qaEsc(h.name)}</b>
+            <em>${qaEsc(h.set)} &middot; ${qaEsc(h.number)}${h.rarity?' &middot; '+qaEsc(h.rarity):''}</em>
+            ${h.price?`<i>${h.price.value.toFixed(2)} ${qaEsc(h.price.currency)}</i>`:''}
+          </span>
+        </button>`).join('')}</div>`;
+
+  host.innerHTML=`<div class="scanDone qaWrap">
+    ${sc.lastAdded?`<p class="qaOk">Added ${qaEsc(sc.lastAdded)} &middot; ${ownedCount()} tracked</p>`:''}
+    <div class="scanCard"><img src="${r.thumb}" alt=""></div>
+    ${r.numStrip?`<div class="strip2">
+      <div class="win"><img src="${r.numStrip}" alt="bottom of card"></div>
+      <span>Collector number &mdash; read it here and type it below.</span>
+    </div>`:''}
+    <div class="qaSearch">
+      <input id="qaQ" type="search" inputmode="search" autocomplete="off"
+             placeholder="Number or name, e.g. 97/084" value="${qaEsc(r.query||'')}">
+      <button class="btn" data-primary id="qaGo">${r.searching?'Searching…':'Find'}</button>
+    </div>
+    ${r.msg?`<p class="scanWarn">${qaEsc(r.msg)}</p>`:''}
+    ${list}
+    <div class="qaFoot">
+      <button class="btn" id="qaSkip">Skip this card</button>
+      <button class="btn" id="qaStop">Done</button>
+    </div>
+  </div>`;
+
+  const q=document.getElementById('qaQ');
+  if (q) {
+    q.onkeydown=e=>{ if (e.key==='Enter') { e.preventDefault(); quickSearch(); } };
+    if (r.hits===null && !r.searching) q.focus();
+  }
+  const go=document.getElementById('qaGo');
+  if (go) go.onclick=quickSearch;
+  host.querySelectorAll('.qaHit').forEach(b=>{
+    b.onclick=()=>quickPick(+b.dataset.i);
+  });
+  const skip=document.getElementById('qaSkip');
+  if (skip) skip.onclick=()=>{ sc.lastAdded=null; quickNext(); };
+  const stop=document.getElementById('qaStop');
+  if (stop) stop.onclick=()=>{ sc.lastAdded=null; sc.mode='grade'; setView('owned'); };
+}
+
+// ---- owned list view ----
+
+function renderOwned() {
+  const host=document.getElementById('owned');
+  if (!host) return;
+  const st=loadOwned();
+  const cards=st.cards;
+  const total=cards.reduce((n,c)=>n+(c.qty||1),0);
+  const worth=cards.reduce((s,c)=>s+((c.price&&c.price.value)||0)*(c.qty||1),0);
+  const cur=(cards.find(c=>c.price&&c.price.currency)||{}).price;
+
+  if (!cards.length) {
+    host.innerHTML=`<div class="ownedWrap">
+      <p class="ownedEmpty">Nothing tracked yet. Use <b>Quick add</b> to scan cards straight into the collection without grading them.</p>
+    </div>`;
+    return;
+  }
+
+  host.innerHTML=`<div class="ownedWrap">
+    <div class="ownedHead">
+      <span><b>${total}</b> cards &middot; <b>${cards.length}</b> distinct${worth?` &middot; about ${worth.toFixed(2)} ${qaEsc(cur?cur.currency:'')}`:''}</span>
+      <button class="btn" id="ownedExport">Export</button>
+    </div>
+    <div class="ownedList">${cards.map(c=>`
+      <div class="ownedRow">
+        ${c.thumb?`<img src="${c.thumb}" alt="">`:'<span class="qaNoImg"></span>'}
+        <span class="ownedMeta">
+          <b>${qaEsc(c.name)}</b>
+          <em>${qaEsc(c.set)} &middot; ${qaEsc(c.number)}${c.supertype?' &middot; '+qaEsc(c.supertype):''}</em>
+          ${c.price?`<i>${c.price.value.toFixed(2)} ${qaEsc(c.price.currency)} each</i>`:''}
+        </span>
+        <span class="ownedQty">
+          <button class="btn" data-less="${qaEsc(c.apiId)}">&minus;</button>
+          <b>${c.qty||1}</b>
+          <button class="btn" data-more="${qaEsc(c.apiId)}">+</button>
+        </span>
+      </div>`).join('')}</div>
+  </div>`;
+
+  const ex=document.getElementById('ownedExport');
+  if (ex) ex.onclick=ownedExport;
+  host.querySelectorAll('[data-more]').forEach(b=>b.onclick=()=>{ ownedAdjust(b.dataset.more,1); renderOwned(); });
+  host.querySelectorAll('[data-less]').forEach(b=>b.onclick=()=>{ ownedAdjust(b.dataset.less,-1); renderOwned(); });
+}
 
 // ===========================================================================
 // COLLECTION VIEW
@@ -2117,6 +2421,12 @@ function setView(v) {
   document.getElementById('collection').style.display = v==='collection'?'':'none';
   document.getElementById('batch').style.display = v==='batch'?'':'none';
   document.getElementById('scan').style.display = v==='scan'?'':'none';
+  const ow=document.getElementById('owned');
+  if (ow) ow.style.display = v==='owned'?'':'none';
+  const qb=document.getElementById('quickBtn');
+  if (qb) qb.dataset.on = (v==='scan'&&state.scan.mode==='quick')?'1':'0';
+  const ob=document.getElementById('ownedBtn');
+  if (ob) { ob.innerHTML=`Tracked (${ownedCount()})`; ob.dataset.on = v==='owned'?'1':'0'; }
   const bb=document.getElementById('batchBtn');
   if (bb) bb.dataset.on = v==='batch'?'1':'0';
   const sb=document.getElementById('scanBtn');
@@ -2131,6 +2441,7 @@ function setView(v) {
   if (v==='collection') renderCollection();
   if (v==='batch') renderBatch();
   if (v==='scan') renderScan();
+  if (v==='owned') renderOwned();
 }
 
 // ===========================================================================
@@ -2818,6 +3129,21 @@ function runScanPipeline(canvas) {
   state.flat=flat; state.quad=quad;
   console.log(`[scan] source ${canvas.width}\u00d7${canvas.height} \u2192 rectified ${flat.w}\u00d7${flat.h} `
     + `= ${(1/flat.mmPerPx).toFixed(1)} px/mm measured (source was ${det.pxPerMm?det.pxPerMm.toFixed(1):'?'})`);
+
+  // Quick add stops here. Finding the card and straightening it is all that is
+  // needed to read the number off the bottom strip; guides, corners, edges and
+  // the grade are all work this mode has no use for.
+  if (state.scan.mode==='quick') {
+    state.scan.busy=false;
+    state.scan.result={
+      ok:true, quick:true,
+      thumb:makeThumb(flat,150), numStrip:makeNumberStrip(flat),
+      hits:null, query:'', searching:false, msg:null
+    };
+    renderScan();
+    return;
+  }
+
   const inner=findInnerBorder(flat);
   state.guides={left:flat.w*0.09,right:flat.w*0.91,top:flat.h*0.09,bottom:flat.h*0.91};
   for (const k of EDGE_KEYS) if (inner.guides[k]!==null) state.guides[k]=inner.guides[k];
@@ -2851,6 +3177,7 @@ function renderScan() {
       document.getElementById('scanAgain').onclick=()=>{ sc.result=null; sc.shot=null; renderScan(); if (cameraPossible()) startScan(); };
       return;
     }
+    if (r.quick) { renderQuickAdd(host, r); return; }
     const c=r.rec.centering;
     const lv=r.level;
     const bad=lv==='failed';
@@ -2992,7 +3319,15 @@ function aspectCheck(quad) {
 
 document.getElementById('collBtn').onclick=()=>setView(state.view==='collection'?'gauge':'collection');
 document.getElementById('batchBtn').onclick=()=>setView(state.view==='batch'?'gauge':'batch');
-document.getElementById('scanBtn').onclick=()=>setView(state.view==='scan'?'gauge':'scan');
+document.getElementById('scanBtn').onclick=()=>{ state.scan.mode='grade'; state.scan.lastAdded=null; setView(state.view==='scan'&&state.scan.mode!=='quick'?'gauge':'scan'); };
+document.getElementById('quickBtn').onclick=()=>{
+  const on = state.view==='scan' && state.scan.mode==='quick';
+  state.scan.mode = on ? 'grade' : 'quick';
+  state.scan.lastAdded=null;
+  state.scan.result=null; state.scan.shot=null;
+  setView(on?'gauge':'scan');
+};
+document.getElementById('ownedBtn').onclick=()=>setView(state.view==='owned'?'gauge':'owned');
 document.getElementById('loadBtn').onclick=()=>document.getElementById('file').click();
 
 document.getElementById('file').onchange = e => {
