@@ -5,7 +5,7 @@
    this file, so this is the only thing to replace when updating.
    =========================================================================== */
 
-const VERSION = 'v49';
+const VERSION = 'v50';
 
 (function boot() {
 
@@ -2232,43 +2232,11 @@ async function ocrReady() {
   }
 }
 
-// Upscale, desaturate and stretch contrast first. Tesseract reads clean
-// high-contrast text far better than a photograph of printed card stock, and
-// the rectified card gives us a known, repeatable crop to work from.
-function numberCanvas(flat) {
-  const pxPerMm=1/flat.mmPerPx;
-  const bandPx=Math.max(1, Math.round(8*pxPerMm));
-  const y0=Math.max(0, flat.h-bandPx);
-  const wCrop=Math.max(1, Math.round(flat.w*0.62));   // the number sits left of centre
-  const up=Math.max(1, Math.min(4, 900/wCrop));
-  const c=document.createElement('canvas');
-  c.width=Math.round(wCrop*up); c.height=Math.round(bandPx*up);
-  const cx=c.getContext('2d',{willReadFrequently:true});
-  cx.imageSmoothingQuality='high';
-  cx.drawImage(flat.canvas, 0,y0, wCrop,bandPx, 0,0, c.width,c.height);
-
-  const d=cx.getImageData(0,0,c.width,c.height), px=d.data;
-  let lo=255, hi=0;
-  for (let i=0;i<px.length;i+=4) {
-    const g=(px[i]*0.299+px[i+1]*0.587+px[i+2]*0.114)|0;
-    px[i]=px[i+1]=px[i+2]=g;
-    if (g<lo) lo=g;
-    if (g>hi) hi=g;
-  }
-  const span=Math.max(1,hi-lo);
-  for (let i=0;i<px.length;i+=4) {
-    const g=Math.max(0,Math.min(255,((px[i]-lo)*255/span)|0));
-    px[i]=px[i+1]=px[i+2]=g;
-  }
-  cx.putImageData(d,0,0);
-  return c;
-}
 
 // The set code beside the number - PRE, SVI, OBF - turns a guess into a lookup.
-// A number on its own is shared by every reverse holo and reprint that carries
-// it; a set code plus a number is very close to a unique key. Codes are pulled
-// from the API once and cached, so a token only counts as a set code if it
-// really is one, and ILLUS or GAME cannot be mistaken for one.
+// A number alone is shared by every reverse holo and reprint carrying it; a set
+// code plus a number is very close to a unique key. Codes come from the API once
+// and are cached, so a candidate only counts if it is genuinely a set code.
 let setCatalogue=null;
 const LANG_TOKENS=new Set(['EN','JP','FR','DE','IT','ES','PT','KO','ZH','NL','RU']);
 
@@ -2288,124 +2256,198 @@ async function loadSetCodes() {
   return setCatalogue;
 }
 
-// Everything worth having out of the bottom line, in one pass.
+// Tesseract runs the set code into whatever follows it - the small EN beside it
+// comes back as PRESET - so codes of three letters or more are matched as
+// substrings rather than whole words. Two-letter codes still need a clean token,
+// because a two-letter fragment turns up inside far too many words to trust.
+function findSetCode(t, codes) {
+  if (!codes || !codes.size) return null;
+  let best=null;
+  for (const code of codes.keys()) {
+    if (LANG_TOKENS.has(code)) continue;
+    let at=-1;
+    if (code.length>=3) at=t.indexOf(code);
+    else { const m=t.match(new RegExp('\\b'+code+'\\b')); at=m?m.index:-1; }
+    if (at<0) continue;
+    if (!best || code.length>best.code.length || (code.length===best.code.length && at<best.at))
+      best={ code, at };
+  }
+  return best ? best.code : null;
+}
+
+// Everything worth having out of the bottom line, with an honest note on how
+// much the number is worth. A slashed pair is a real reading; a lone digit
+// pulled out of noise is not, and treating the two alike is what produced
+// "12 cards share 4".
 function parseStripText(text, codes) {
   const t=(text||'').toUpperCase().replace(/[|]/g,'I');
-  const out={ number:null, total:null, setCode:null, regMark:null };
+  const out={ number:null, total:null, setCode:null, regMark:null, trust:'none' };
 
   const m=t.match(/(\d{1,3})\s*\/\s*(\d{1,3})/);
-  if (m) { out.number=parseInt(m[1],10); out.total=parseInt(m[2],10); }
-  else {
+  if (m) {
+    out.number=parseInt(m[1],10); out.total=parseInt(m[2],10); out.trust='strong';
+  } else {
     const solo=t.match(/\b(\d{1,3})\b(?!\s*\/)/);
-    if (solo) out.number=parseInt(solo[1],10);
+    if (solo) { out.number=parseInt(solo[1],10); out.trust='weak'; }
   }
 
-  if (codes && codes.size)
-    for (const tok of (t.match(/\b[A-Z]{2,4}\b/g)||[]))
-      if (!LANG_TOKENS.has(tok) && codes.has(tok)) { out.setCode=tok; break; }
+  out.setCode=findSetCode(t, codes);
 
-  // The regulation mark sits in its own box immediately before the set code.
-  // Anchoring it there matters: a bare single letter anywhere on the line picks
-  // up initials out of the illustrator credit instead.
   if (out.setCode) {
-    const rm=t.match(new RegExp('(?:^|[^A-Z])([D-K])\\\\s+'+out.setCode+'\\\\b'));
+    const rm=t.match(new RegExp('(?:^|[^A-Z])([D-K])\\s*'+out.setCode+'\\b'));
     if (rm) out.regMark=rm[1];
   }
-
   return out;
 }
 
-// The card name, read from the top band. Weaker than the number - names sit in
-// stylised type over artwork - so it is only ever used to narrow a number that
-// already matched several cards.
-function nameCanvas(flat) {
-  const bandPx=Math.max(1, Math.round(9*(1/flat.mmPerPx)));
-  const wCrop=Math.max(1, Math.round(flat.w*0.72));
-  const up=Math.max(1, Math.min(4, 900/wCrop));
+// Sharpen before handing anything to Tesseract. The text on these crops is
+// soft because the card was photographed at around 11 px/mm and then scaled up,
+// and a light unsharp pass recovers enough edge for the recogniser to bite on.
+function prepCanvas(src) {
+  const w=src.width, h=src.height;
+  const cx=src.getContext('2d',{ willReadFrequently:true });
+  const img=cx.getImageData(0,0,w,h), px=img.data;
+
+  let lo=255, hi=0;
+  const grey=new Uint8ClampedArray(w*h);
+  for (let i=0,p=0;i<px.length;i+=4,p++) {
+    const g=(px[i]*0.299+px[i+1]*0.587+px[i+2]*0.114)|0;
+    grey[p]=g;
+    if (g<lo) lo=g;
+    if (g>hi) hi=g;
+  }
+  const span=Math.max(1,hi-lo);
+
+  const out=new Uint8ClampedArray(w*h);
+  for (let y=0;y<h;y++) for (let x=0;x<w;x++) {
+    const p=y*w+x;
+    if (x===0||y===0||x===w-1||y===h-1) { out[p]=grey[p]; continue; }
+    // 3x3 unsharp: centre weighted up, neighbours subtracted.
+    const s = 9*grey[p]
+      - grey[p-1] - grey[p+1] - grey[p-w] - grey[p+w]
+      - grey[p-w-1] - grey[p-w+1] - grey[p+w-1] - grey[p+w+1];
+    out[p]=Math.max(0,Math.min(255, grey[p]*0.35 + s*0.65));
+  }
+
+  for (let i=0,p=0;i<px.length;i+=4,p++) {
+    const v=Math.max(0,Math.min(255,((out[p]-lo)*255/span)|0));
+    px[i]=px[i+1]=px[i+2]=v;
+  }
+  cx.putImageData(img,0,0);
+  return src;
+}
+
+// Crop a horizontal band off the rectified card, scaled so the text is tall
+// enough for Tesseract to work with rather than left at whatever the photo gave.
+function bandCanvas(flat, fromTop, mmTall, widthFrac, targetPx) {
+  const pxPerMm=1/flat.mmPerPx;
+  const bandPx=Math.max(1, Math.round(mmTall*pxPerMm));
+  const y0=fromTop ? 0 : Math.max(0, flat.h-bandPx);
+  const wCrop=Math.max(1, Math.round(flat.w*widthFrac));
+  const up=Math.max(1, Math.min(4, targetPx/bandPx));
   const c=document.createElement('canvas');
   c.width=Math.round(wCrop*up); c.height=Math.round(bandPx*up);
   const cx=c.getContext('2d',{ willReadFrequently:true });
   cx.imageSmoothingQuality='high';
-  cx.drawImage(flat.canvas, 0,0, wCrop,bandPx, 0,0, c.width,c.height);
-  return c;
+  cx.drawImage(flat.canvas, 0,y0, wCrop,bandPx, 0,0, c.width,c.height);
+  return prepCanvas(c);
+}
+
+const numberCanvas = flat => bandCanvas(flat, false, 8, 0.62, 300);
+const nameCanvas   = flat => bandCanvas(flat, true,  10, 0.75, 320);
+
+async function ocrPass(canvas, psm) {
+  await ocrWorker.setParameters({ tessedit_pageseg_mode:psm });
+  const r=await ocrWorker.recognize(canvas);
+  return { text:((r&&r.data&&r.data.text)||'').trim(),
+           conf:(r&&r.data&&r.data.confidence)||0 };
 }
 
 async function readCardFacts(flat) {
   if (!(await ocrReady())) return { ok:false, why:'number reading is unavailable here' };
   const codes=await loadSetCodes();
   try {
-    const r=await ocrWorker.recognize(numberCanvas(flat));
-    const text=(r&&r.data&&r.data.text)||'';
-    const conf=(r&&r.data&&r.data.confidence)||0;
-    const f=parseStripText(text, codes);
-    console.log(`[ocr] "${text.trim().replace(/\n/g,' | ')}" conf=${Math.round(conf)} `
-      + `-> ${f.setCode||'??'} ${f.number!=null?f.number:'??'}${f.total?'/'+f.total:''}`);
-    return { ok:f.number!=null, text:text.trim(), conf, facts:f,
-             why:f.number!=null?null:'no number found on the card' };
+    const c=numberCanvas(flat);
+    let pass=await ocrPass(c,'6');
+    let f=parseStripText(pass.text, codes);
+    // Block mode assumes tidy lines. When it finds nothing, sparse mode often
+    // picks the number out of a crop the layout analyser gave up on.
+    if (f.trust!=='strong') {
+      const alt=await ocrPass(c,'11');
+      const af=parseStripText(alt.text, codes);
+      if (af.trust==='strong' || (!f.setCode && af.setCode)) { pass=alt; f=af; }
+    }
+    console.log(`[ocr] number band "${pass.text.replace(/\n/g,' | ')}" conf=${Math.round(pass.conf)} `
+      + `-> set=${f.setCode||'--'} num=${f.number!=null?f.number:'--'}${f.total?'/'+f.total:''} trust=${f.trust}`);
+    return { ok:true, text:pass.text, conf:pass.conf, facts:f };
   } catch(e) {
     return { ok:false, why:'number reading failed' };
   }
 }
 
+// The name is roughly three times the height of the collector number, so it
+// survives a soft photo far better. That makes it a primary route to the card,
+// not just a tiebreaker.
 async function readCardName(flat) {
   if (ocrState!=='ready') return null;
   try {
-    const r=await ocrWorker.recognize(nameCanvas(flat));
-    const raw=((r&&r.data&&r.data.text)||'').split('\n')[0].trim();
-    const cleaned=raw.replace(/[^A-Za-z' -]/g,' ').replace(/\s+/g,' ').trim();
-    console.log(`[ocr] name band -> "${cleaned}"`);
-    return cleaned.length>=3 ? cleaned : null;
+    const pass=await ocrPass(nameCanvas(flat),'7');
+    const first=(pass.text||'').split('\n').map(l=>l.trim()).filter(Boolean)[0]||'';
+    const cleaned=first.replace(/[^A-Za-z' -]/g,' ').replace(/\s+/g,' ').trim();
+    console.log(`[ocr] name band "${first}" -> "${cleaned}" conf=${Math.round(pass.conf)}`);
+    return cleaned.length>=3 ? { name:cleaned, conf:pass.conf } : null;
   } catch(e) { return null; }
 }
 
-// The bar for adding a card without asking. Everything else goes to review.
+async function tryQuery(q) {
+  try { return (await apiGet(q,24)).map(mapCard); } catch(e) { return []; }
+}
+
+// Routes to the card, strongest first. Each one is tried only if the evidence it
+// needs actually survived OCR, and a route only settles the matter when it comes
+// back with exactly one card.
 async function autoIdentify(flat) {
   const read=await readCardFacts(flat);
-  if (!read.ok) return { confident:false, why:read.why||'number not read', read };
+  if (!read.ok) return { confident:false, why:read.why||'nothing read', read };
 
   const f=read.facts;
-  const n=String(f.number);
+  const nameRead=await readCardName(flat);
+  const nm=nameRead?nameRead.name:null;
+  const n=f.number!=null?String(f.number):null;
+  const numberUsable = f.trust==='strong' || (f.trust==='weak' && read.conf>=OCR_MIN_CONF);
 
-  // Set code plus number: as close to an exact lookup as this data gets. The
-  // code was validated against the real catalogue, which is strong evidence in
-  // its own right, so a middling OCR score is tolerable here.
-  if (f.setCode) {
-    let hits=[];
-    for (const q of [`set.ptcgoCode:${f.setCode} number:${n}`,
-                     `set.ptcgoCode:${f.setCode} number:"${n}"`]) {
-      try { hits=(await apiGet(q,24)).map(mapCard); } catch(e) { hits=[]; }
-      if (hits.length) break;
+  const routes=[];
+  if (f.setCode && n && numberUsable)
+    routes.push({ q:`set.ptcgoCode:${f.setCode} number:${n}`, via:`${f.setCode} ${n}`, min:45 });
+  if (nm && n && numberUsable)
+    routes.push({ q:`name:"*${nm}*" number:${n}`, via:`${nm} ${n}`, min:40 });
+  if (nm && f.setCode)
+    routes.push({ q:`name:"*${nm}*" set.ptcgoCode:${f.setCode}`, via:`${nm} in ${f.setCode}`, min:40 });
+  if (nm)
+    routes.push({ q:`name:"*${nm}*"`, via:nm, min:55 });
+  if (n && f.trust==='strong')
+    routes.push({ q:`number:${n}`, via:n, min:OCR_MIN_CONF });
+
+  if (!routes.length)
+    return { confident:false, read, name:nm,
+             why:f.number!=null?`only read a stray "${f.number}"`:'nothing legible on the card' };
+
+  let widest=[];
+  for (const r of routes) {
+    const hits=await tryQuery(r.q);
+    if (!hits.length) continue;
+    if (hits.length===1) {
+      const conf=Math.max(read.conf, nameRead&&r.via===nm?nameRead.conf:0);
+      if (conf>=r.min) return { confident:true, hit:hits[0], read, name:nm, via:r.via };
+      return { confident:false, read, name:nm, hits,
+               why:`looks like ${hits[0].name}, only ${Math.round(conf)}% sure` };
     }
-    if (hits.length===1 && read.conf>=45)
-      return { confident:true, hit:hits[0], read, via:`${f.setCode} ${n}` };
-    if (hits.length>1)
-      return { confident:false, read, hits, why:`${hits.length} cards are ${f.setCode} ${n}` };
+    if (!widest.length || hits.length<widest.length) widest=hits;
   }
 
-  // No usable set code: fall back to the number, then try the name to break a tie.
-  let hits=[];
-  try { hits=await searchCards(f.total?`${n}/${f.total}`:n); }
-  catch(e) { return { confident:false, why:'lookup failed', read }; }
-
-  if (!hits.length) return { confident:false, why:`nothing matched ${n}`, read, hits };
-
-  if (hits.length>1) {
-    const nm=await readCardName(flat);
-    if (nm) {
-      const key=nm.toLowerCase();
-      const narrowed=hits.filter(h=>h.name.toLowerCase().indexOf(key)>=0
-                                 || key.indexOf(h.name.toLowerCase())>=0);
-      if (narrowed.length===1 && read.conf>=OCR_MIN_CONF)
-        return { confident:true, hit:narrowed[0], read, via:`${nm} ${n}` };
-      if (narrowed.length) hits=narrowed;
-    }
-  }
-
-  if (hits.length>1)
-    return { confident:false, why:`${hits.length} cards share ${n}`, read, hits };
-  if (read.conf < OCR_MIN_CONF)
-    return { confident:false, read, why:`read as ${n}, only ${Math.round(read.conf)}% sure` };
-  return { confident:true, hit:hits[0], read, via:n };
+  return { confident:false, read, name:nm, hits:widest,
+           why: widest.length ? `${widest.length} cards match ${nm||n}`
+                              : `nothing matched ${nm||n||'that'}` };
 }
 
 // ---- hands-free capture ----
@@ -2462,6 +2504,7 @@ async function quickAuto(flat) {
     thumb:sc.result.thumb, strip:sc.result.reviewStrip,
     ocr:res.read?res.read.text:'', conf:res.read?Math.round(res.read.conf||0):0,
     setCode:f.setCode||null, number:f.number!=null?f.number:null, total:f.total||null,
+    trust:f.trust||'none', name:res.name||null,
     why:res.why||'uncertain'
   });
   if (!r.ok) { sc.result.autoBusy=false; sc.result.autoMsg=r.error; renderScan(); return; }
@@ -2502,7 +2545,7 @@ function renderReview() {
       <button class="btn" id="rvBack">&larr; Back to queue (${st.items.length})</button>
       <div class="scanCard"><img src="${it.thumb}" alt=""></div>
       ${it.strip?`<div class="strip2"><div class="win"><img src="${it.strip}" alt="bottom of card"></div>
-        <span>${qaEsc(it.why||'')}${it.setCode?` &middot; set ${qaEsc(it.setCode)}`:''}${it.ocr?` &middot; read “${qaEsc(it.ocr.replace(/\n/g,' ').slice(0,60))}” (${it.conf}%)`:''}</span></div>`:''}
+        <span>${qaEsc(it.why||'')}${it.name?` &middot; name “${qaEsc(it.name)}”`:''}${it.setCode?` &middot; set ${qaEsc(it.setCode)}`:''}${it.ocr?` &middot; read “${qaEsc(it.ocr.replace(/\n/g,' ').slice(0,50))}” (${it.conf}%)`:''}</span></div>`:''}
       <div class="qaSearch">
         <input id="rvQ" type="search" inputmode="search" autocomplete="off"
                placeholder="Number or name" value="${qaEsc(rv.query!=null?rv.query:reviewGuess(it))}">
@@ -2536,7 +2579,7 @@ function renderReview() {
       <button class="ownedRow rvRow" data-open="${it.id}">
         ${it.thumb?`<img src="${it.thumb}" alt="">`:'<span class="qaNoImg"></span>'}
         <span class="ownedMeta">
-          <b>${qaEsc(it.ocr?it.ocr.replace(/\n/g,' ').slice(0,28):'unread')}</b>
+          <b>${qaEsc(it.name||(it.number!=null&&it.trust==='strong'?String(it.number):'unread'))}</b>
           <em>${qaEsc(it.why||'')}</em>
         </span>
       </button>`).join('')}</div>
@@ -2549,8 +2592,11 @@ function renderReview() {
 
 // Best starting point for the box: whatever was actually parsed off the card.
 function reviewGuess(it) {
+  // Name first: it is what actually got read on a soft photo, and a stray digit
+  // from a 12%-confidence pass is worse than nothing in the box.
+  if (it.name) return it.name;
   if (it.number!=null && it.total) return `${it.number}/${it.total}`;
-  if (it.number!=null) return String(it.number);
+  if (it.number!=null && it.trust==='strong') return String(it.number);
   const m=(it.ocr||'').match(/\d{1,3}\s*\/\s*\d{1,3}/);
   return m ? m[0].replace(/\s/g,'') : '';
 }
