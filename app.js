@@ -5,7 +5,7 @@
    this file, so this is the only thing to replace when updating.
    =========================================================================== */
 
-const VERSION = 'v50';
+const VERSION = 'v52';
 
 (function boot() {
 
@@ -2047,6 +2047,7 @@ function renderQuickAdd(host, r) {
 
   host.innerHTML=`<div class="scanDone qaWrap">
     ${r.autoBusy?`<p class="qaOk">${qaEsc(r.autoMsg||'Working…')}</p>`:''}
+    ${r.fault?`<p class="scanWarn">${qaEsc(r.fault)} — the strip below will not show the card's bottom line, so type the number from the card itself.</p>`:''}
     ${sc.lastAdded?`<p class="qaOk">Added ${qaEsc(sc.lastAdded)} &middot; ${ownedCount()} tracked</p>`:''}
     <div class="scanCard"><img src="${r.thumb}" alt=""></div>
     ${r.numStrip?`<div class="strip2">
@@ -2476,6 +2477,35 @@ function maybeAutoCapture() {
   } else sc.goodRun=0;
 }
 
+// The same geometry questions the grading path asks, minus everything
+// expensive. If the outline is not card-shaped, or a side was fitted through
+// scatter, nothing cropped from it can be trusted - least of all a thin strip
+// taken from its very bottom edge.
+function quickGeometryFault(det, quad) {
+  const a=aspectCheck(quad);
+  if (a && a.off>0.05)
+    return `outline is ${a.seen.toFixed(3)} where a card is ${a.want.toFixed(3)} — the edges are not on the card`;
+  const dead=EDGE_KEYS.filter(k=>fitUnusable(det.fits[k]));
+  if (dead.length)
+    return `no usable edge on ${dead.join(', ')} — the outline is a guess`;
+  return null;
+}
+
+// A strip with almost no contrast holds no text. Cheap to check, and it stops a
+// pointless three-second OCR pass on an image of the mat.
+function stripHasInk(flat) {
+  const c=bandCanvas(flat, false, 8, 0.62, 120);
+  const cx=c.getContext('2d',{ willReadFrequently:true });
+  const d=cx.getImageData(0,0,c.width,c.height).data;
+  let n=0, sum=0, sq=0;
+  for (let i=0;i<d.length;i+=16) { const v=d[i]; sum+=v; sq+=v*v; n++; }
+  if (!n) return false;
+  const mean=sum/n;
+  const sd=Math.sqrt(Math.max(0, sq/n - mean*mean));
+  console.log(`[ocr] strip contrast sd=${sd.toFixed(1)}`);
+  return sd>18;
+}
+
 async function quickAuto(flat) {
   const sc=state.scan;
   if (!sc.result) return;
@@ -2483,7 +2513,14 @@ async function quickAuto(flat) {
   sc.result.autoMsg='Reading the number\u2026';
   renderScan();
 
-  const res=await autoIdentify(flat);
+  let res;
+  if (sc.result.fault) {
+    res={ confident:false, why:sc.result.fault };
+  } else if (!stripHasInk(flat)) {
+    res={ confident:false, why:'bottom strip is blank — the crop missed the card' };
+  } else {
+    res=await autoIdentify(flat);
+  }
   if (!sc.result) return;                       // moved on while we were working
 
   if (res.confident) {
@@ -3718,6 +3755,10 @@ function quickFrame(cnv, nativeH) {
   const estPxPerMm = nativeH ? (longSide*nativeH)/CARD_MM.h : null;
 
   return { found:true, fill, marginMin, skew, estPxPerMm,
+           // Shape of the box actually found, in preview pixels. A card is
+           // 0.716 wide-over-tall whichever way up it is; anything far off that
+           // is not a card outline, so there is no point capturing it.
+           shape: Math.min(cw,ch)/Math.max(cw,ch),
            box:{ x:L/w, y:T/h, w:cw/w, h:ch/h },
            sep: spread };
 }
@@ -3733,6 +3774,11 @@ function scanVerdict(q) {
   }
   if (q.marginMin < SCAN_MIN_MARGIN) { notes.push('leave a gap all round'); hard=true; }
   if (q.skew > 0.10) { notes.push('hold the phone flatter'); hard=true; }
+  // 0.716 is a card. Drifting well off it means the outline has caught a shadow
+  // or run past an edge, and capturing that only fills the review queue.
+  if (q.shape!=null && Math.abs(q.shape-(CARD_MM.w/CARD_MM.h))>0.06) {
+    notes.push('outline is not card-shaped'); hard=true;
+  }
 
   if (!notes.length) return { level:'good', text:'Ready' };
   return { level: hard ? 'bad' : 'soft', text: notes.join(' · ') };
@@ -3967,13 +4013,15 @@ function runScanPipeline(canvas) {
   console.log(`[scan] source ${canvas.width}\u00d7${canvas.height} \u2192 rectified ${flat.w}\u00d7${flat.h} `
     + `= ${(1/flat.mmPerPx).toFixed(1)} px/mm measured (source was ${det.pxPerMm?det.pxPerMm.toFixed(1):'?'})`);
 
-  // Quick add stops here. Finding the card and straightening it is all that is
-  // needed to read the number off the bottom strip; guides, corners, edges and
-  // the grade are all work this mode has no use for.
+  // Quick add skips the grading work - guides, corners, edges - but NOT the
+  // checks that say whether the outline is a card at all. Skipping those was a
+  // mistake: a quad that runs past the bottom of the card produces a strip full
+  // of mat, and the reader then spends its effort on a photograph of felt.
   if (state.scan.mode==='quick') {
     state.scan.busy=false;
+    const bad=quickGeometryFault(det, quad);
     state.scan.result={
-      ok:true, quick:true,
+      ok:true, quick:true, fault:bad,
       thumb:makeThumb(flat,150), numStrip:makeNumberStrip(flat),
       reviewStrip:makeReviewStrip(flat,600),
       hits:null, query:'', searching:false, msg:null,
