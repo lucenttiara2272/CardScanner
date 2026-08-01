@@ -5,7 +5,7 @@
    this file, so this is the only thing to replace when updating.
    =========================================================================== */
 
-const VERSION = 'v53';
+const VERSION = 'v54';
 
 (function boot() {
 
@@ -2286,16 +2286,48 @@ function findSetCode(t, codes) {
 // much the number is worth. A slashed pair is a real reading; a lone digit
 // pulled out of noise is not, and treating the two alike is what produced
 // "12 cards share 4".
+// The separator is the least reliable character on the line. A slash comes back
+// as a 7, a 1, an I, or vanishes entirely, so "079/086" arrives as "0797086".
+// Rather than demand a literal slash, produce every plausible split and let the
+// card database decide which one is a real card - the same trick that keeps the
+// set codes honest.
+function numberCandidates(t) {
+  const seen=new Set(), out=[];
+  const push=(a,b,trust)=>{
+    const n=parseInt(a,10), tot=b!=null?parseInt(b,10):null;
+    if (!(n>=1 && n<=999)) return;
+    if (tot!=null && !(tot>=1 && tot<=999)) return;
+    const key=n+'/'+tot;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ number:n, total:tot, trust });
+  };
+
+  for (const m of t.matchAll(/(\d{1,3})\s*\/\s*(\d{1,3})/g)) push(m[1],m[2],'strong');
+  // A separator misread as a character rather than dropped.
+  for (const m of t.matchAll(/(\d{2,3})\s*[\/71IlJ]\s*(\d{2,3})/g)) push(m[1],m[2],'split');
+  // Separator lost completely, digits run together.
+  for (const m of t.matchAll(/\d{6,8}/g)) {
+    const d=m[0];
+    if (d.length===6) push(d.slice(0,3), d.slice(3), 'split');
+    if (d.length===7) { push(d.slice(0,3), d.slice(4), 'split'); push(d.slice(0,3), d.slice(3,6), 'split'); }
+    if (d.length===8) push(d.slice(0,4), d.slice(4), 'split');
+  }
+  if (!out.length) {
+    const solo=t.match(/\b(\d{1,3})\b/);
+    if (solo) push(solo[1], null, 'weak');
+  }
+  return out;
+}
+
 function parseStripText(text, codes) {
   const t=(text||'').toUpperCase().replace(/[|]/g,'I');
-  const out={ number:null, total:null, setCode:null, regMark:null, trust:'none' };
+  const out={ number:null, total:null, setCode:null, regMark:null, trust:'none', candidates:[] };
 
-  const m=t.match(/(\d{1,3})\s*\/\s*(\d{1,3})/);
-  if (m) {
-    out.number=parseInt(m[1],10); out.total=parseInt(m[2],10); out.trust='strong';
-  } else {
-    const solo=t.match(/\b(\d{1,3})\b(?!\s*\/)/);
-    if (solo) { out.number=parseInt(solo[1],10); out.trust='weak'; }
+  out.candidates=numberCandidates(t);
+  if (out.candidates.length) {
+    const c=out.candidates[0];
+    out.number=c.number; out.total=c.total; out.trust=c.trust;
   }
 
   out.setCode=findSetCode(t, codes);
@@ -2379,13 +2411,14 @@ async function readCardFacts(flat) {
     let f=parseStripText(pass.text, codes);
     // Block mode assumes tidy lines. When it finds nothing, sparse mode often
     // picks the number out of a crop the layout analyser gave up on.
-    if (f.trust!=='strong') {
+    if (f.trust!=='strong' || !f.setCode) {
       const alt=await ocrPass(c,'11');
       const af=parseStripText(alt.text, codes);
-      if (af.trust==='strong' || (!f.setCode && af.setCode)) { pass=alt; f=af; }
+      if ((af.trust==='strong' && f.trust!=='strong') || (!f.setCode && af.setCode)) { pass=alt; f=af; }
     }
     console.log(`[ocr] number band "${pass.text.replace(/\n/g,' | ')}" conf=${Math.round(pass.conf)} `
-      + `-> set=${f.setCode||'--'} num=${f.number!=null?f.number:'--'}${f.total?'/'+f.total:''} trust=${f.trust}`);
+      + `-> set=${f.setCode||'--'} candidates=`
+      + (f.candidates.length?f.candidates.map(c=>`${c.number}${c.total?'/'+c.total:''}(${c.trust})`).join(' '):'none'));
     return { ok:true, text:pass.text, conf:pass.conf, facts:f };
   } catch(e) {
     return { ok:false, why:'number reading failed' };
@@ -2395,14 +2428,24 @@ async function readCardFacts(flat) {
 // The name is roughly three times the height of the collector number, so it
 // survives a soft photo far better. That makes it a primary route to the card,
 // not just a tiebreaker.
+// The top strip is never one line. A Trainer carries its category on the left
+// and TRAINER on the right above the name; a Pokemon carries its stage and what
+// it evolves from. Single-line mode blends all of that into pulp, so read it as
+// a block and throw away the labels.
+const NAME_NOISE=/^(TRAINER|ITEM|SUPPORTER|STADIUM|TOOL|POKEMON TOOL|POKEMON|BASIC|STAGE ?[12]|ENERGY|SPECIAL ENERGY|EVOLVES FROM.*|[VX]|VMAX|VSTAR|EX|GX)$/i;
+
 async function readCardName(flat) {
   if (ocrState!=='ready') return null;
   try {
-    const pass=await ocrPass(nameCanvas(flat),'7');
-    const first=(pass.text||'').split('\n').map(l=>l.trim()).filter(Boolean)[0]||'';
-    const cleaned=first.replace(/[^A-Za-z' -]/g,' ').replace(/\s+/g,' ').trim();
-    console.log(`[ocr] name band "${first}" -> "${cleaned}" conf=${Math.round(pass.conf)}`);
-    return cleaned.length>=3 ? { name:cleaned, conf:pass.conf } : null;
+    const pass=await ocrPass(nameCanvas(flat),'6');
+    const lines=(pass.text||'').split('\n')
+      .map(l=>l.replace(/[^A-Za-z' -]/g,' ').replace(/\s+/g,' ').trim())
+      .filter(l=>l.length>=3 && !NAME_NOISE.test(l));
+    // The name is the substantial line; the rest is furniture.
+    lines.sort((a,b)=>b.length-a.length);
+    const best=lines[0]||'';
+    console.log(`[ocr] name band "${(pass.text||'').replace(/\n/g,' | ')}" -> "${best}" conf=${Math.round(pass.conf)}`);
+    return best.length>=3 ? { name:best, conf:pass.conf } : null;
   } catch(e) { return null; }
 }
 
@@ -2428,20 +2471,24 @@ async function autoIdentify(flat, note) {
              why:(note?note+' · ':'')+(read.why||'nothing legible on the card') };
 
   const f=read.facts||{ number:null, total:null, setCode:null, trust:'none' };
+  const cands=(f.candidates||[]).filter(c=>c.trust!=='weak' || read.conf>=OCR_MIN_CONF).slice(0,4);
   const n=f.number!=null?String(f.number):null;
-  const numberUsable = f.trust==='strong' || (f.trust==='weak' && read.conf>=OCR_MIN_CONF);
 
+  // Every combination worth asking about, strongest evidence first. A candidate
+  // that came from a guessed separator is fine to try - the database rejects the
+  // wrong splits by returning nothing.
   const routes=[];
-  if (f.setCode && n && numberUsable)
-    routes.push({ q:`set.ptcgoCode:${f.setCode} number:${n}`, via:`${f.setCode} ${n}`, min:45 });
-  if (nm && n && numberUsable)
-    routes.push({ q:`name:"*${nm}*" number:${n}`, via:`${nm} ${n}`, min:40 });
+  for (const c of cands) {
+    const num=String(c.number);
+    if (f.setCode) routes.push({ q:`set.ptcgoCode:${f.setCode} number:${num}`, via:`${f.setCode} ${num}`, min:45 });
+    if (nm)        routes.push({ q:`name:"*${nm}*" number:${num}`, via:`${nm} ${num}`, min:40 });
+  }
   if (nm && f.setCode)
     routes.push({ q:`name:"*${nm}*" set.ptcgoCode:${f.setCode}`, via:`${nm} in ${f.setCode}`, min:40 });
   if (nm)
     routes.push({ q:`name:"*${nm}*"`, via:nm, min:55 });
-  if (n && f.trust==='strong')
-    routes.push({ q:`number:${n}`, via:n, min:OCR_MIN_CONF });
+  for (const c of cands)
+    if (c.total) routes.push({ q:`number:${c.number}`, total:c.total, via:`${c.number}/${c.total}`, min:50 });
 
   if (!routes.length)
     return { confident:false, read, name:nm,
@@ -2450,7 +2497,13 @@ async function autoIdentify(flat, note) {
 
   let widest=[];
   for (const r of routes) {
-    const hits=await tryQuery(r.q);
+    let hits=await tryQuery(r.q);
+    // A printed total is a free filter: 79 exists in dozens of sets, but 79 in a
+    // set of 86 is nearly unique.
+    if (r.total) {
+      const narrowed=hits.filter(h=>h.printedTotal===r.total);
+      if (narrowed.length) hits=narrowed;
+    }
     if (!hits.length) continue;
     if (hits.length===1) {
       const conf=Math.max(read.conf, nameRead&&r.via===nm?nameRead.conf:0);
