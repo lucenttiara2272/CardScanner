@@ -5,7 +5,7 @@
    this file, so this is the only thing to replace when updating.
    =========================================================================== */
 
-const VERSION = 'v52';
+const VERSION = 'v53';
 
 (function boot() {
 
@@ -1760,6 +1760,12 @@ async function apiGet(q, pageSize) {
     const err=new Error('network'); err.kind='network'; throw err;
   }
   if (!res.ok) {
+    // A 250-row request ordered by release date is heavy enough that the API
+    // sometimes just gives up. One cheaper retry costs little and rescues most
+    // of them; a real failure still surfaces.
+    if (res.status>=500 && pageSize>60) {
+      try { return await apiGet(q, 60); } catch(e) {}
+    }
     const err=new Error('http '+res.status); err.kind='http'; err.status=res.status; throw err;
   }
   const json=await res.json();
@@ -2047,7 +2053,7 @@ function renderQuickAdd(host, r) {
 
   host.innerHTML=`<div class="scanDone qaWrap">
     ${r.autoBusy?`<p class="qaOk">${qaEsc(r.autoMsg||'Working…')}</p>`:''}
-    ${r.fault?`<p class="scanWarn">${qaEsc(r.fault)} — the strip below will not show the card's bottom line, so type the number from the card itself.</p>`:''}
+    ${r.fault?`<p class="scanWarn">${qaEsc(r.fault)}. The strip below may still be readable — check it before typing.</p>`:''}
     ${sc.lastAdded?`<p class="qaOk">Added ${qaEsc(sc.lastAdded)} &middot; ${ownedCount()} tracked</p>`:''}
     <div class="scanCard"><img src="${r.thumb}" alt=""></div>
     ${r.numStrip?`<div class="strip2">
@@ -2407,13 +2413,21 @@ async function tryQuery(q) {
 // Routes to the card, strongest first. Each one is tried only if the evidence it
 // needs actually survived OCR, and a route only settles the matter when it comes
 // back with exactly one card.
-async function autoIdentify(flat) {
-  const read=await readCardFacts(flat);
-  if (!read.ok) return { confident:false, why:read.why||'nothing read', read };
-
-  const f=read.facts;
+async function autoIdentify(flat, note) {
+  // The name band comes off the top of the card, so it survives the commonest
+  // failure - an outline that runs past the bottom edge. Read it first and
+  // always, rather than treating it as a fallback.
   const nameRead=await readCardName(flat);
   const nm=nameRead?nameRead.name:null;
+
+  const inked=stripHasInk(flat);
+  const read = inked ? await readCardFacts(flat)
+                     : { ok:false, conf:0, text:'', why:'bottom strip is blank' };
+  if (!read.ok && !nm)
+    return { confident:false, read, name:null,
+             why:(note?note+' · ':'')+(read.why||'nothing legible on the card') };
+
+  const f=read.facts||{ number:null, total:null, setCode:null, trust:'none' };
   const n=f.number!=null?String(f.number):null;
   const numberUsable = f.trust==='strong' || (f.trust==='weak' && read.conf>=OCR_MIN_CONF);
 
@@ -2431,7 +2445,8 @@ async function autoIdentify(flat) {
 
   if (!routes.length)
     return { confident:false, read, name:nm,
-             why:f.number!=null?`only read a stray "${f.number}"`:'nothing legible on the card' };
+             why:(note?note+' · ':'')
+                 +(f.number!=null?`only read a stray "${f.number}"`:'nothing legible on the card') };
 
   let widest=[];
   for (const r of routes) {
@@ -2481,13 +2496,18 @@ function maybeAutoCapture() {
 // expensive. If the outline is not card-shaped, or a side was fitted through
 // scatter, nothing cropped from it can be trusted - least of all a thin strip
 // taken from its very bottom edge.
-function quickGeometryFault(det, quad) {
-  const a=aspectCheck(quad);
-  if (a && a.off>0.05)
-    return `outline is ${a.seen.toFixed(3)} where a card is ${a.want.toFixed(3)} — the edges are not on the card`;
+function quickGeometryNote(det, quad) {
+  // Aspect is only meaningful on a squarely-shot card. Under perspective a real
+  // card measures well off 0.716, which is why refreshAspect bails above this
+  // same tilt threshold - and why gating on aspect alone rejected cards whose
+  // strips were perfectly readable.
+  if (tiltCheck(quad) < 1.06) {
+    const a=aspectCheck(quad);
+    if (a && a.off>0.05)
+      return `outline is ${a.seen.toFixed(3)} where a card is ${a.want.toFixed(3)} — edges may be off the card`;
+  }
   const dead=EDGE_KEYS.filter(k=>fitUnusable(det.fits[k]));
-  if (dead.length)
-    return `no usable edge on ${dead.join(', ')} — the outline is a guess`;
+  if (dead.length) return `no usable edge on ${dead.join(', ')} — the outline is a guess`;
   return null;
 }
 
@@ -2513,14 +2533,10 @@ async function quickAuto(flat) {
   sc.result.autoMsg='Reading the number\u2026';
   renderScan();
 
-  let res;
-  if (sc.result.fault) {
-    res={ confident:false, why:sc.result.fault };
-  } else if (!stripHasInk(flat)) {
-    res={ confident:false, why:'bottom strip is blank — the crop missed the card' };
-  } else {
-    res=await autoIdentify(flat);
-  }
+  // Always try. A quad that overshoots the bottom edge ruins the number strip
+  // but leaves the name band at the top untouched, so there is still a route to
+  // the card - and refusing to look was throwing that away.
+  const res=await autoIdentify(flat, sc.result.fault);
   if (!sc.result) return;                       // moved on while we were working
 
   if (res.confident) {
@@ -4019,9 +4035,9 @@ function runScanPipeline(canvas) {
   // of mat, and the reader then spends its effort on a photograph of felt.
   if (state.scan.mode==='quick') {
     state.scan.busy=false;
-    const bad=quickGeometryFault(det, quad);
+    const bad=quickGeometryNote(det, quad);
     state.scan.result={
-      ok:true, quick:true, fault:bad,
+      ok:true, quick:true, fault:bad,   // advisory only - never blocks a read
       thumb:makeThumb(flat,150), numStrip:makeNumberStrip(flat),
       reviewStrip:makeReviewStrip(flat,600),
       hits:null, query:'', searching:false, msg:null,
