@@ -5,7 +5,7 @@
    this file, so this is the only thing to replace when updating.
    =========================================================================== */
 
-const VERSION = 'v62';
+const VERSION = 'v64';
 
 (function boot() {
 
@@ -405,6 +405,11 @@ const CSS = String.raw`
   .deckCost { margin:0; font-size:12px; color:var(--ink-dim); }
 
   .autoLine { margin:0; font-size:11px; line-height:1.6; color:var(--ink-dim); }
+  .camBar { display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+            font-size:11px; color:var(--ink-dim); margin-bottom:6px; }
+  .camBar select { flex:1; min-width:0; padding:7px 8px; font-size:13px;
+                   border-radius:5px; border:1px solid var(--line);
+                   background:var(--panel); color:var(--ink); }
   .autoWarn { color:var(--warn,#e5a33c); }
   .rvRow { width:100%; text-align:left; cursor:pointer; color:var(--ink); }
   .scanNums[data-doubt="1"] .scanWarn { color:var(--fail); border-left-color:var(--fail); }
@@ -591,6 +596,7 @@ const state = {
   scan:{ stream:null, running:false, lastCheck:0, quality:null, shot:null, result:null, busy:false, error:null,
         mode:'grade', lastAdded:null, lastReview:null,
         autoCapture:false, autoId:false, armed:true, goodRun:0, clearRun:0,
+        cams:[], camNow:null,
         autoStats:{ added:0, review:0 } },
   batch:null, batchCalib:null,
   deck:null,
@@ -2307,6 +2313,8 @@ function findSetCode(t, codes) {
 function numberCandidates(t) {
   const seen=new Set(), out=[];
   const push=(a,b,trust)=>{
+    // parseInt drops the leading zero, which is what the database wants anyway:
+    // the card printed as 095/167 is number 95 in the API.
     const n=parseInt(a,10), tot=b!=null?parseInt(b,10):null;
     if (!(n>=1 && n<=999)) return;
     if (tot!=null && !(tot>=1 && tot<=999)) return;
@@ -2316,7 +2324,14 @@ function numberCandidates(t) {
     out.push({ number:n, total:tot, trust });
   };
 
-  for (const m of t.matchAll(/(\d{1,3})\s*\/\s*(\d{1,3})/g)) push(m[1],m[2],'strong');
+  // A digit group longer than three has picked up a neighbour: "095/167" comes
+  // back as "0955/1674". Which end the spare digit is on cannot be known from
+  // the text, so offer both readings of each group and let the database decide.
+  const splits=g => g.length<=3 ? [g] : [g.slice(0,3), g.slice(-3), g.slice(0,4)];
+  for (const m of t.matchAll(/(\d{1,4})\s*\/\s*(\d{1,4})/g))
+    for (const a of splits(m[1]))
+      for (const b of splits(m[2]))
+        push(a, b, (m[1].length<=3 && m[2].length<=3) ? 'strong' : 'split');
   // A separator misread as a character rather than dropped.
   for (const m of t.matchAll(/(\d{2,3})\s*[\/71IlJ]\s*(\d{2,3})/g)) push(m[1],m[2],'split');
   // Separator lost completely, digits run together.
@@ -2731,6 +2746,38 @@ async function autoIdentify(flat, note) {
   return { confident:false, read, name:nm, hits:widest,
            why: widest.length ? `${widest.length} cards match ${nm||n}, artwork could not separate them`
                               : `nothing matched ${nm||n||'that'}` };
+}
+
+// ---- camera choice ----
+
+const CAM_KEY='centeringGauge.camera.v1';
+const camPref = () => { try { return localStorage.getItem(CAM_KEY)||null; } catch(e) { return null; } };
+const setCamPref = id => { try { id?localStorage.setItem(CAM_KEY,id):localStorage.removeItem(CAM_KEY); } catch(e) {} };
+
+async function listCameras() {
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return [];
+    const all=await navigator.mediaDevices.enumerateDevices();
+    state.scan.cams=all.filter(d=>d.kind==='videoinput')
+      .map((d,i)=>({ id:d.deviceId, label:d.label||`Camera ${i+1}` }));
+    console.log('[cam] devices: '+(state.scan.cams.map(c=>c.label).join(' | ')||'none listed'));
+    return state.scan.cams;
+  } catch(e) { return []; }
+}
+
+// Front cameras are never useful here. Phone labels are inconsistent, so keep
+// whatever the browser gives and only drop the obvious ones.
+function rearCameras() {
+  const cams=state.scan.cams||[];
+  const rear=cams.filter(c=>!/front|face|user|selfie/i.test(c.label));
+  return rear.length?rear:cams;
+}
+
+async function useCamera(id) {
+  setCamPref(id);
+  stopScan();
+  state.scan.result=null;
+  await startScan();
 }
 
 // ---- hands-free capture ----
@@ -4097,12 +4144,21 @@ async function startScan() {
   state.scan.error=null;
   setScanStatus('Starting camera\u2026');
 
-  const tries=[
+  // A phone with three rear cameras exposes three devices, and the browser picks
+  // whichever it calls "the" back camera - usually the 12MP main sensor, not the
+  // 50MP or 200MP one. Naming a deviceId is the only way to reach the others.
+  // The ideals are set absurdly high on purpose: the browser clamps down to the
+  // best mode the chosen camera actually supports.
+  const want=camPref();
+  const big={ width:{ ideal:7680 }, height:{ ideal:4320 } };
+  const tries=[];
+  if (want) tries.push({ video:{ deviceId:{ exact:want }, ...big }, audio:false });
+  tries.push(
+    { video:{ facingMode:{ ideal:'environment' }, ...big }, audio:false },
     { video:{ facingMode:{ ideal:'environment' }, width:{ ideal:3840 }, height:{ ideal:2160 } }, audio:false },
-    { video:{ facingMode:{ ideal:'environment' }, width:{ ideal:2560 }, height:{ ideal:1440 } }, audio:false },
     { video:{ facingMode:{ ideal:'environment' } }, audio:false },
     { video:true, audio:false }                     // laptops with only a front camera
-  ];
+  );
 
   let stream=null, lastErr=null;
   for (const c of tries) {
@@ -4133,7 +4189,12 @@ async function startScan() {
     const cap=t.getCapabilities?t.getCapabilities():{};
     console.log('[scan] stream settings', s);
     console.log('[scan] stream capabilities', cap);
-  } catch(e) {}
+    state.scan.camNow={ id:s.deviceId||null, w:s.width||null, h:s.height||null,
+      maxW:(cap.width&&cap.width.max)||null, maxH:(cap.height&&cap.height.max)||null };
+  } catch(e) { state.scan.camNow=null; }
+  // Device labels are only revealed once permission has been granted, so the
+  // list is built after the stream opens rather than before.
+  listCameras().then(()=>{ if (state.view==='scan') renderScan(); });
 
   attachStream(v);
 }
@@ -4450,6 +4511,17 @@ function renderScan() {
     </div>
     <div class="scanVerdict" id="scanVerdict" data-lv="bad"><b>Starting camera…</b></div>
     ${sc.error?`<p class="scanBad">${sc.error}</p>`:''}
+    ${(()=>{
+      const cams=rearCameras(), now=sc.camNow;
+      const mp = now&&now.maxW&&now.maxH ? (now.maxW*now.maxH/1e6) : null;
+      if (!cams.length && !now) return '';
+      return `<div class="camBar">
+        ${cams.length>1?`<select id="camPick">${cams.map(c=>
+          `<option value="${c.id}" ${now&&now.id===c.id?'selected':''}>${qaEsc(c.label)}</option>`).join('')}</select>`:''}
+        <span>${now&&now.w?`preview ${now.w}\u00d7${now.h}`:'camera starting'}${
+          mp?` · stills up to ${mp.toFixed(1)}MP`:''}</span>
+      </div>`;
+    })()}
     <div class="scanActions">
       <button class="btn" data-primary id="scanShot" data-ready="0">Capture</button>
       ${sc.mode==='quick'?`<button class="btn" id="scanAuto" data-on="${sc.autoCapture?'1':'0'}">Auto ${sc.autoCapture?'on':'off'}</button>`:''}
@@ -4468,6 +4540,8 @@ function renderScan() {
   </div>`;
 
   document.getElementById('scanShot').onclick=captureScan;
+  const cp=document.getElementById('camPick');
+  if (cp) cp.onchange=()=>useCamera(cp.value);
   const au=document.getElementById('scanAuto');
   if (au) au.onclick=async ()=>{
     const sc=state.scan;
