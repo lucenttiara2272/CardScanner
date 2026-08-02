@@ -5,7 +5,7 @@
    this file, so this is the only thing to replace when updating.
    =========================================================================== */
 
-const VERSION = 'v57';
+const VERSION = 'v59';
 
 (function boot() {
 
@@ -724,7 +724,11 @@ function fitUnusable(f) {
 }
 
 function getPixels(img) {
-  const s=Math.min(1,DETECT_W/Math.max(img.width,img.height));
+  // Quick add only has to locate the card well enough to rectify it and read
+  // printed text. Grading precision costs real time on a phone - the scan runs
+  // twice and the cost goes with the area - and buys nothing here.
+  const cap = (state.scan && state.scan.mode==='quick') ? 900 : DETECT_W;
+  const s=Math.min(1,cap/Math.max(img.width,img.height));
   const w=Math.round(img.width*s), h=Math.round(img.height*s);
   const c=document.createElement('canvas');
   c.width=w; c.height=h;
@@ -1214,7 +1218,10 @@ function straighten(img,quad) {
   // flatters the edge fit without adding any real information - so the source
   // is the ceiling and MIN_EDGE the floor.
   const nativeH = Math.round(Math.max(tall, wide*mmH/mmW));
-  const H = Math.max(MIN_EDGE, Math.min(nativeH, MAX_EDGE));
+  // Same reasoning for the rectified copy: OCR wants legible text, not the
+  // sub-pixel edge detail a grade depends on. The resampling loop is per-pixel.
+  const ceiling = (state.scan && state.scan.mode==='quick') ? 1500 : MAX_EDGE;
+  const H = Math.max(MIN_EDGE, Math.min(nativeH, ceiling));
   const W = Math.round(H*mmW/mmH);
 
   const src=document.createElement('canvas');
@@ -2150,6 +2157,7 @@ function renderOwned() {
 
 const REVIEW_KEY='centeringGauge.review.v1';
 const AUTO_GOOD_FRAMES  = 4;    // ~0.9s of steady good framing before firing
+const AUTO_SOFT_FRAMES  = 9;    // ~2s of steady amber, for awkward lighting
 const AUTO_CLEAR_FRAMES = 2;    // the card must leave the frame before re-arming
 const OCR_MIN_CONF      = 60;   // Tesseract's own confidence, 0-100
 const REVIEW_MAX        = 200;
@@ -2388,22 +2396,34 @@ function prepCanvas(src) {
 
 // Crop a horizontal band off the rectified card, scaled so the text is tall
 // enough for Tesseract to work with rather than left at whatever the photo gave.
-function bandCanvas(flat, fromTop, mmTall, widthFrac, targetPx) {
+// Cut a rectangle out of the rectified card in millimetres, because the card is
+// a known physical object and every feature on it sits at a known place. The
+// previous version could only take a band from the very top or the very bottom,
+// which is why the name crop began at 0mm - above where any name is printed -
+// and caught the border instead of the text.
+function bandCanvas(flat, mmTop, mmBottom, x0, x1, targetPx) {
   const pxPerMm=1/flat.mmPerPx;
-  const bandPx=Math.max(1, Math.round(mmTall*pxPerMm));
-  const y0=fromTop ? 0 : Math.max(0, flat.h-bandPx);
-  const wCrop=Math.max(1, Math.round(flat.w*widthFrac));
-  const up=Math.max(1, Math.min(4, targetPx/bandPx));
+  const y0=Math.max(0, Math.round(mmTop*pxPerMm));
+  const y1=Math.min(flat.h, Math.round(mmBottom*pxPerMm));
+  const sx=Math.max(0, Math.round(flat.w*x0));
+  const sw=Math.max(1, Math.round(flat.w*(x1-x0)));
+  const sh=Math.max(1, y1-y0);
+  const up=Math.max(1, Math.min(5, targetPx/sh));
   const c=document.createElement('canvas');
-  c.width=Math.round(wCrop*up); c.height=Math.round(bandPx*up);
+  c.width=Math.round(sw*up); c.height=Math.round(sh*up);
   const cx=c.getContext('2d',{ willReadFrequently:true });
   cx.imageSmoothingQuality='high';
-  cx.drawImage(flat.canvas, 0,y0, wCrop,bandPx, 0,0, c.width,c.height);
+  cx.drawImage(flat.canvas, sx,y0, sw,sh, 0,0, c.width,c.height);
   return prepCanvas(c);
 }
 
-const numberCanvas = flat => bandCanvas(flat, false, 8, 0.62, 300);
-const nameCanvas   = flat => bandCanvas(flat, true,  10, 0.75, 320);
+// Where things actually are on a 63x88mm card, measured off real cards:
+//   - the name runs about 5mm to 12mm down, left of the HP
+//   - the set code and collector number sit on the last printed line, roughly
+//     82mm down, in the left half - the illustrator credit is the line above and
+//     the rules text is to the right, and both were being fed in as noise
+const numberCanvas = flat => bandCanvas(flat, 81.5, 87.5, 0.02, 0.52, 190);
+const nameCanvas   = flat => bandCanvas(flat,  4.0, 13.5, 0.04, 0.76, 210);
 
 // Two bands, two alphabets. The bottom line is digits, a slash and the capitals
 // of a set code; the name is mixed case with apostrophes and hyphens. Narrowing
@@ -2433,10 +2453,12 @@ async function readCardFacts(flat) {
     let f=parseStripText(pass.text, codes);
     // Block mode assumes tidy lines. When it finds nothing, sparse mode often
     // picks the number out of a crop the layout analyser gave up on.
-    if (f.trust!=='strong' || !f.setCode) {
+    // A second pass costs as much as the first, so it only runs when the first
+    // came back with nothing usable at all - not merely something imperfect.
+    if (!f.candidates.length && !f.setCode) {
       const alt=await ocrPass(c,'11',OCR_ALPHABET.number);
       const af=parseStripText(alt.text, codes);
-      if ((af.trust==='strong' && f.trust!=='strong') || (!f.setCode && af.setCode)) { pass=alt; f=af; }
+      if (af.candidates.length || af.setCode) { pass=alt; f=af; }
     }
     console.log(`[ocr] number band "${pass.text.replace(/\n/g,' | ')}" conf=${Math.round(pass.conf)} `
       + `-> set=${f.setCode||'--'} candidates=`
@@ -2597,12 +2619,17 @@ function maybeAutoCapture() {
     return;
   }
 
-  // 'good' only. 'soft' framing is fine when a person chose to press the button
-  // and can see what they are photographing; it is not fine unattended.
+  // Grading needs good framing. Reading printed text does not, and holding out
+  // for green under side lighting just means never firing - glare that ruins a
+  // centering measurement often leaves the name and number perfectly legible.
+  // So: fire on green quickly, or on amber after a longer, steadier hold.
   if (vd.level==='good') {
-    sc.goodRun=(sc.goodRun||0)+1;
-    if (sc.goodRun>=AUTO_GOOD_FRAMES) { sc.goodRun=0; sc.armed=false; captureScan(); }
-  } else sc.goodRun=0;
+    sc.goodRun=(sc.goodRun||0)+1; sc.softRun=0;
+    if (sc.goodRun>=AUTO_GOOD_FRAMES) { sc.goodRun=0; sc.softRun=0; sc.armed=false; captureScan(); }
+  } else if (vd.level==='soft') {
+    sc.softRun=(sc.softRun||0)+1; sc.goodRun=0;
+    if (sc.softRun>=AUTO_SOFT_FRAMES) { sc.goodRun=0; sc.softRun=0; sc.armed=false; captureScan(); }
+  } else { sc.goodRun=0; sc.softRun=0; }
 }
 
 // The same geometry questions the grading path asks, minus everything
@@ -2627,7 +2654,7 @@ function quickGeometryNote(det, quad) {
 // A strip with almost no contrast holds no text. Cheap to check, and it stops a
 // pointless three-second OCR pass on an image of the mat.
 function stripHasInk(flat) {
-  const c=bandCanvas(flat, false, 8, 0.62, 120);
+  const c=bandCanvas(flat, 81.5, 87.5, 0.02, 0.52, 110);
   const cx=c.getContext('2d',{ willReadFrequently:true });
   const d=cx.getImageData(0,0,c.width,c.height).data;
   let n=0, sum=0, sq=0;
@@ -3910,6 +3937,13 @@ function scanVerdict(q) {
   // thin side is a real fault: an outline taller than a card has overshot it.
   if (q.shape!=null && q.shape < (CARD_MM.w/CARD_MM.h)-0.10) {
     notes.push('outline is taller than a card'); hard=true;
+  }
+  // The other end: a card would have to lie at nearly 40 degrees to bound a
+  // near-square box, and the skew check would have caught that first. In
+  // practice this is the outline having latched onto something that is not the
+  // card - which is exactly what a 0.996 reading means.
+  if (q.shape!=null && q.shape > 0.95) {
+    notes.push('outline is not card-shaped'); hard=true;
   }
 
   if (!notes.length) return { level:'good', text:'Ready' };
