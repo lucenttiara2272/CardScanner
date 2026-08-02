@@ -5,7 +5,7 @@
    this file, so this is the only thing to replace when updating.
    =========================================================================== */
 
-const VERSION = 'v59';
+const VERSION = 'v60';
 
 (function boot() {
 
@@ -2495,6 +2495,23 @@ function nameLooksReal(t) {
   return w.reduce((n,x)=>n+x.length,0)/w.length >= 3.2;
 }
 
+// OCR reads the name band as one line, so it collects crumbs from whatever else
+// touches that strip - a stage tag, an HP figure, the edge of a symbol. That is
+// how "Munkidori" arrives as "gg Munkidori", and a wildcard search wraps the
+// junk along with the name and matches nothing. So search for several readings
+// of the same line, narrowest junk removed first, and let the database pick.
+function nameVariants(nm) {
+  const out=[];
+  const add=x=>{ const t=(x||'').trim(); if (t.length>=3 && out.indexOf(t)<0) out.push(t); };
+  add(nm);
+  const w=(nm||'').split(/\s+/).filter(Boolean);
+  // Drop stray one and two character tokens - no card name contains them alone.
+  add(w.filter(x=>x.length>=3).join(' '));
+  // Failing that, the longest word is nearly always the name itself.
+  if (w.length>1) add(w.slice().sort((a,b)=>b.length-a.length)[0]);
+  return out.slice(0,3);
+}
+
 // A name route is only believable if the card it found is actually called
 // something like what was read.
 function nameSimilar(read, found) {
@@ -2556,16 +2573,17 @@ async function autoIdentify(flat, note) {
   // Every combination worth asking about, strongest evidence first. A candidate
   // that came from a guessed separator is fine to try - the database rejects the
   // wrong splits by returning nothing.
+  const nms=nm?nameVariants(nm):[];
   const routes=[];
   for (const c of cands) {
     const num=String(c.number);
     if (f.setCode) routes.push({ q:`set.ptcgoCode:${f.setCode} number:${num}`, via:`${f.setCode} ${num}`, min:45 });
-    if (nm)        routes.push({ q:`name:"*${nm}*" number:${num}`, via:`${nm} ${num}`, min:40 });
+    for (const v of nms) routes.push({ q:`name:"*${v}*" number:${num}`, via:`${v} ${num}`, min:40, name:v });
   }
-  if (nm && f.setCode)
-    routes.push({ q:`name:"*${nm}*" set.ptcgoCode:${f.setCode}`, via:`${nm} in ${f.setCode}`, min:40 });
-  if (nm)
-    routes.push({ q:`name:"*${nm}*"`, via:nm, min:55 });
+  for (const v of nms)
+    if (f.setCode) routes.push({ q:`name:"*${v}*" set.ptcgoCode:${f.setCode}`, via:`${v} in ${f.setCode}`, min:40, name:v });
+  for (const v of nms)
+    routes.push({ q:`name:"*${v}*"`, via:v, min:55, name:v });
   for (const c of cands)
     if (c.total) routes.push({ q:`number:${c.number}`, total:c.total, via:`${c.number}/${c.total}`, min:50 });
 
@@ -2586,10 +2604,10 @@ async function autoIdentify(flat, note) {
     if (!hits.length) continue;
     // The database matched something, but a loose wildcard will match almost
     // anything. If this route leaned on the name, the answer has to look like it.
-    if (nm && r.q.indexOf('name:')>=0 && !hits.some(h=>nameSimilar(nm,h.name))) continue;
+    if (r.name && !hits.some(h=>nameSimilar(r.name,h.name))) continue;
     if (hits.length===1) {
-      const conf=Math.max(read.conf, nameRead&&r.via===nm?nameRead.conf:0);
-      if (conf>=r.min) return { confident:true, hit:hits[0], read, name:nm, via:r.via };
+      const conf=Math.max(read.conf, (nameRead && r.name)?nameRead.conf:0);
+      if (conf>=r.min) return { confident:true, hit:hits[0], read, name:r.name||nm, via:r.via };
       return { confident:false, read, name:nm, hits,
                why:`looks like ${hits[0].name}, only ${Math.round(conf)}% sure` };
     }
