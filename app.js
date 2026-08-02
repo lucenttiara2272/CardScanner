@@ -5,7 +5,7 @@
    this file, so this is the only thing to replace when updating.
    =========================================================================== */
 
-const VERSION = 'v56';
+const VERSION = 'v57';
 
 (function boot() {
 
@@ -2223,7 +2223,11 @@ async function ocrReady() {
     await ocrWorker.setParameters({
       // The number is digits and a slash. Narrowing the alphabet is the single
       // biggest accuracy win available here.
-      tessedit_char_whitelist:'0123456789/ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+      // Whitelist is set per pass now, not here - see OCR_ALPHABET. Leaving the
+      // digits-and-capitals list installed globally meant the name band could
+      // only ever return capitals, so "Munkidori" came back as noise and every
+      // name route was dead on arrival.
+      tessedit_char_whitelist:'',
       // Block mode, not single-line. The bottom crop routinely holds two lines -
       // the rules text above and the illustrator/set/number line below - and
       // single-line mode garbles anything with more than one.
@@ -2401,8 +2405,20 @@ function bandCanvas(flat, fromTop, mmTall, widthFrac, targetPx) {
 const numberCanvas = flat => bandCanvas(flat, false, 8, 0.62, 300);
 const nameCanvas   = flat => bandCanvas(flat, true,  10, 0.75, 320);
 
-async function ocrPass(canvas, psm) {
-  await ocrWorker.setParameters({ tessedit_pageseg_mode:psm });
+// Two bands, two alphabets. The bottom line is digits, a slash and the capitals
+// of a set code; the name is mixed case with apostrophes and hyphens. Narrowing
+// the alphabet is the biggest accuracy win available - but only if it is the
+// right alphabet for what is being read.
+const OCR_ALPHABET = {
+  number:'0123456789/ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+  name:"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'- .é"
+};
+
+async function ocrPass(canvas, psm, alphabet) {
+  await ocrWorker.setParameters({
+    tessedit_pageseg_mode:psm,
+    tessedit_char_whitelist:alphabet||''
+  });
   const r=await ocrWorker.recognize(canvas);
   return { text:((r&&r.data&&r.data.text)||'').trim(),
            conf:(r&&r.data&&r.data.confidence)||0 };
@@ -2413,12 +2429,12 @@ async function readCardFacts(flat) {
   const codes=await loadSetCodes();
   try {
     const c=numberCanvas(flat);
-    let pass=await ocrPass(c,'6');
+    let pass=await ocrPass(c,'6',OCR_ALPHABET.number);
     let f=parseStripText(pass.text, codes);
     // Block mode assumes tidy lines. When it finds nothing, sparse mode often
     // picks the number out of a crop the layout analyser gave up on.
     if (f.trust!=='strong' || !f.setCode) {
-      const alt=await ocrPass(c,'11');
+      const alt=await ocrPass(c,'11',OCR_ALPHABET.number);
       const af=parseStripText(alt.text, codes);
       if ((af.trust==='strong' && f.trust!=='strong') || (!f.setCode && af.setCode)) { pass=alt; f=af; }
     }
@@ -2476,7 +2492,7 @@ function nameSimilar(read, found) {
 async function readCardName(flat) {
   if (ocrState!=='ready') return null;
   try {
-    const pass=await ocrPass(nameCanvas(flat),'6');
+    const pass=await ocrPass(nameCanvas(flat),'6',OCR_ALPHABET.name);
     const lines=(pass.text||'').split('\n')
       .map(l=>l.replace(/[^A-Za-z' -]/g,' ').replace(/\s+/g,' ').trim())
       .filter(l=>l.length>=3 && !NAME_NOISE.test(l));
@@ -3887,10 +3903,13 @@ function scanVerdict(q) {
   }
   if (q.marginMin < SCAN_MIN_MARGIN) { notes.push('leave a gap all round'); hard=true; }
   if (q.skew > 0.10) { notes.push('hold the phone flatter'); hard=true; }
-  // 0.716 is a card. Drifting well off it means the outline has caught a shadow
-  // or run past an edge, and capturing that only fills the review queue.
-  if (q.shape!=null && Math.abs(q.shape-(CARD_MM.w/CARD_MM.h))>0.06) {
-    notes.push('outline is not card-shaped'); hard=true;
+  // The box here is axis-aligned, so a card lying at an angle measures FATTER
+  // than 0.716, not thinner - at 15 degrees it reads about 0.83. Rejecting
+  // symmetrically around 0.716 therefore refused every card that was not
+  // perfectly square to the frame, which is why capture sat waiting. Only the
+  // thin side is a real fault: an outline taller than a card has overshot it.
+  if (q.shape!=null && q.shape < (CARD_MM.w/CARD_MM.h)-0.10) {
+    notes.push('outline is taller than a card'); hard=true;
   }
 
   if (!notes.length) return { level:'good', text:'Ready' };
