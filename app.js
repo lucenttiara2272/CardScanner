@@ -5,7 +5,7 @@
    this file, so this is the only thing to replace when updating.
    =========================================================================== */
 
-const VERSION = 'v61';
+const VERSION = 'v62';
 
 (function boot() {
 
@@ -1218,10 +1218,12 @@ function straighten(img,quad) {
   // flatters the edge fit without adding any real information - so the source
   // is the ceiling and MIN_EDGE the floor.
   const nativeH = Math.round(Math.max(tall, wide*mmH/mmW));
-  // Same reasoning for the rectified copy: OCR wants legible text, not the
-  // sub-pixel edge detail a grade depends on. The resampling loop is per-pixel.
-  const ceiling = (state.scan && state.scan.mode==='quick') ? 1500 : MAX_EDGE;
-  const H = Math.max(MIN_EDGE, Math.min(nativeH, ceiling));
+  // No quick-mode shortcut here, and the reason is worth recording: capping this
+  // at 1500 to save time cut the rectified card to about 17 px/mm, which put the
+  // collector number near 25px tall and stopped OCR reading anything at all.
+  // Detection can be cheap because it only has to locate the card. This step
+  // produces the image the text is read from, so it gets the full budget.
+  const H = Math.max(MIN_EDGE, Math.min(nativeH, MAX_EDGE));
   const W = Math.round(H*mmW/mmH);
 
   const src=document.createElement('canvas');
@@ -2156,8 +2158,7 @@ function renderOwned() {
 // ===========================================================================
 
 const REVIEW_KEY='centeringGauge.review.v1';
-const AUTO_GOOD_FRAMES  = 4;    // ~0.9s of steady good framing before firing
-const AUTO_SOFT_FRAMES  = 9;    // ~2s of steady amber, for awkward lighting
+const AUTO_GOOD_FRAMES  = 3;    // ~0.7s of steady good framing before firing
 const AUTO_CLEAR_FRAMES = 2;    // the card must leave the frame before re-arming
 const OCR_MIN_CONF      = 60;   // Tesseract's own confidence, 0-100
 const REVIEW_MAX        = 200;
@@ -2447,6 +2448,12 @@ async function ocrPass(canvas, psm, alphabet) {
 async function readCardFacts(flat) {
   if (!(await ocrReady())) return { ok:false, why:'number reading is unavailable here' };
   const codes=await loadSetCodes();
+  // The single number that predicts whether any of this can work. A collector
+  // number is about 1.5mm tall, so below roughly 25 px/mm it is under 40px even
+  // after upscaling, and Tesseract has little to work with.
+  const pxmm=1/flat.mmPerPx;
+  console.log(`[ocr] reading a card rectified at ${pxmm.toFixed(1)} px/mm`
+    + (pxmm<22?' — too low for the collector number, expect the name to carry it':''));
   try {
     const c=numberCanvas(flat);
     let pass=await ocrPass(c,'6',OCR_ALPHABET.number);
@@ -2744,17 +2751,15 @@ function maybeAutoCapture() {
     return;
   }
 
-  // Grading needs good framing. Reading printed text does not, and holding out
-  // for green under side lighting just means never firing - glare that ruins a
-  // centering measurement often leaves the name and number perfectly legible.
-  // So: fire on green quickly, or on amber after a longer, steadier hold.
+  // Firing on amber was meant to help under side lighting. It did the opposite:
+  // it captured frames too poor to read, and an unreadable capture costs more
+  // than a slow one - it lands in the review queue to be typed by hand. Green
+  // only, but fewer frames of it, so speed comes from deciding sooner rather
+  // than from accepting worse.
   if (vd.level==='good') {
-    sc.goodRun=(sc.goodRun||0)+1; sc.softRun=0;
-    if (sc.goodRun>=AUTO_GOOD_FRAMES) { sc.goodRun=0; sc.softRun=0; sc.armed=false; captureScan(); }
-  } else if (vd.level==='soft') {
-    sc.softRun=(sc.softRun||0)+1; sc.goodRun=0;
-    if (sc.softRun>=AUTO_SOFT_FRAMES) { sc.goodRun=0; sc.softRun=0; sc.armed=false; captureScan(); }
-  } else { sc.goodRun=0; sc.softRun=0; }
+    sc.goodRun=(sc.goodRun||0)+1;
+    if (sc.goodRun>=AUTO_GOOD_FRAMES) { sc.goodRun=0; sc.armed=false; captureScan(); }
+  } else sc.goodRun=0;
 }
 
 // The same geometry questions the grading path asks, minus everything
