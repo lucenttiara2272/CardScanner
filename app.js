@@ -5,7 +5,7 @@
    this file, so this is the only thing to replace when updating.
    =========================================================================== */
 
-const VERSION = 'v54';
+const VERSION = 'v56';
 
 (function boot() {
 
@@ -2342,6 +2342,10 @@ function parseStripText(text, codes) {
 // Sharpen before handing anything to Tesseract. The text on these crops is
 // soft because the card was photographed at around 11 px/mm and then scaled up,
 // and a light unsharp pass recovers enough edge for the recogniser to bite on.
+// How hard to sharpen before recognition. Too little and soft digits stay
+// soft; too much and thin strokes break into speckle.
+const UNSHARP=0.9;
+
 function prepCanvas(src) {
   const w=src.width, h=src.height;
   const cx=src.getContext('2d',{ willReadFrequently:true });
@@ -2361,11 +2365,13 @@ function prepCanvas(src) {
   for (let y=0;y<h;y++) for (let x=0;x<w;x++) {
     const p=y*w+x;
     if (x===0||y===0||x===w-1||y===h-1) { out[p]=grey[p]; continue; }
-    // 3x3 unsharp: centre weighted up, neighbours subtracted.
-    const s = 9*grey[p]
-      - grey[p-1] - grey[p+1] - grey[p-w] - grey[p+w]
-      - grey[p-w-1] - grey[p-w+1] - grey[p+w-1] - grey[p+w+1];
-    out[p]=Math.max(0,Math.min(255, grey[p]*0.35 + s*0.65));
+    // Standard unsharp: push the pixel away from its neighbourhood average.
+    // The previous form subtracted eight full neighbours from a ninefold centre,
+    // which all but binarised thin antialiased strokes - and digits on a card
+    // are thin antialiased strokes.
+    const avg=(grey[p-1]+grey[p+1]+grey[p-w]+grey[p+w]
+             + grey[p-w-1]+grey[p-w+1]+grey[p+w-1]+grey[p+w+1])/8;
+    out[p]=Math.max(0,Math.min(255, grey[p] + UNSHARP*(grey[p]-avg)));
   }
 
   for (let i=0,p=0;i<px.length;i+=4,p++) {
@@ -2434,6 +2440,39 @@ async function readCardFacts(flat) {
 // a block and throw away the labels.
 const NAME_NOISE=/^(TRAINER|ITEM|SUPPORTER|STADIUM|TOOL|POKEMON TOOL|POKEMON|BASIC|STAGE ?[12]|ENERGY|SPECIAL ENERGY|EVOLVES FROM.*|[VX]|VMAX|VSTAR|EX|GX)$/i;
 
+// OCR noise off artwork looks like "SER RWWW F EJ BRR ES TED": many short
+// tokens, stray single letters. A wildcard search on that still matches cards,
+// which is worse than reading nothing at all - so a candidate has to look like a
+// name before it is allowed near the database.
+function nameLooksReal(t) {
+  const s=(t||'').trim();
+  if (s.length<3 || s.length>32) return false;
+  if (!/[aeiou]/i.test(s)) return false;
+  const w=s.split(/\s+/);
+  if (w.length>4) return false;
+  if (w.filter(x=>x.length===1).length>1) return false;
+  // No card name has a fourteen-letter word. OCR noise does.
+  if (w.some(x=>x.length>13)) return false;
+  if (w.length===1) return w[0].length>=3;
+  return w.reduce((n,x)=>n+x.length,0)/w.length >= 3.2;
+}
+
+// A name route is only believable if the card it found is actually called
+// something like what was read.
+function nameSimilar(read, found) {
+  const norm=x=>(x||'').toLowerCase().replace(/[^a-z]/g,'');
+  const head=x=>(x||'').toLowerCase().replace(/[^a-z ]/g,'').trim().split(/\s+/)[0]||'';
+  const a=norm(read), b=norm(found);
+  if (!a || !b) return false;
+  if (a===b) return true;
+  // First words agreeing covers ordinary misreads - "Air Ballon" for "Air
+  // Balloon" - without letting a three-letter read swallow a longer card.
+  if (head(read) && head(read)===head(found)) return true;
+  // Containment is only safe once there is enough of it to mean something:
+  // "Eri" sits inside "Erika's Bellsprout" and they are different cards.
+  return a.length>=5 && b.length>=5 && (a.includes(b) || b.includes(a));
+}
+
 async function readCardName(flat) {
   if (ocrState!=='ready') return null;
   try {
@@ -2443,9 +2482,11 @@ async function readCardName(flat) {
       .filter(l=>l.length>=3 && !NAME_NOISE.test(l));
     // The name is the substantial line; the rest is furniture.
     lines.sort((a,b)=>b.length-a.length);
-    const best=lines[0]||'';
-    console.log(`[ocr] name band "${(pass.text||'').replace(/\n/g,' | ')}" -> "${best}" conf=${Math.round(pass.conf)}`);
-    return best.length>=3 ? { name:best, conf:pass.conf } : null;
+    const best=lines.find(nameLooksReal)||'';
+    console.log(`[ocr] name band "${(pass.text||'').replace(/\n/g,' | ')}" -> `
+      + (best?`"${best}"`:`nothing name-shaped (best line "${lines[0]||''}")`)
+      + ` conf=${Math.round(pass.conf)}`);
+    return best ? { name:best, conf:pass.conf } : null;
   } catch(e) { return null; }
 }
 
@@ -2505,6 +2546,9 @@ async function autoIdentify(flat, note) {
       if (narrowed.length) hits=narrowed;
     }
     if (!hits.length) continue;
+    // The database matched something, but a loose wildcard will match almost
+    // anything. If this route leaned on the name, the answer has to look like it.
+    if (nm && r.q.indexOf('name:')>=0 && !hits.some(h=>nameSimilar(nm,h.name))) continue;
     if (hits.length===1) {
       const conf=Math.max(read.conf, nameRead&&r.via===nm?nameRead.conf:0);
       if (conf>=r.min) return { confident:true, hit:hits[0], read, name:nm, via:r.via };
