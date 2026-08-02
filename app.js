@@ -5,7 +5,7 @@
    this file, so this is the only thing to replace when updating.
    =========================================================================== */
 
-const VERSION = 'v60';
+const VERSION = 'v61';
 
 (function boot() {
 
@@ -2545,6 +2545,84 @@ async function readCardName(flat) {
   } catch(e) { return null; }
 }
 
+// ---------------------------------------------------------------------------
+// Identify by artwork, when text cannot
+//
+// Text on a card is small and the photograph is soft, so there is a hard floor
+// on what OCR can do. The picture is not small. A perceptual hash of the whole
+// card compares the capture against each candidate's own thumbnail, which
+// settles cases like "seven printings called Munkidori" without reading a
+// single character.
+// ---------------------------------------------------------------------------
+
+// dHash: compare each pixel with its right-hand neighbour on a 9x8 grid. It
+// describes gradients rather than absolute values, so it survives the exposure
+// and colour differences between a phone photo and a catalogue scan.
+function dHash(canvas) {
+  const W=9, H=8;
+  const c=document.createElement('canvas');
+  c.width=W; c.height=H;
+  const cx=c.getContext('2d',{ willReadFrequently:true });
+  cx.imageSmoothingQuality='high';
+  cx.drawImage(canvas, 0,0, W,H);
+  const d=cx.getImageData(0,0,W,H).data;
+  const g=[];
+  for (let i=0;i<d.length;i+=4) g.push(d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114);
+  const bits=[];
+  for (let y=0;y<H;y++) for (let x=0;x<W-1;x++) bits.push(g[y*W+x] > g[y*W+x+1] ? 1:0);
+  return bits;
+}
+
+const hashDistance = (a,b) => {
+  if (!a||!b||a.length!==b.length) return 64;
+  let n=0;
+  for (let i=0;i<a.length;i++) if (a[i]!==b[i]) n++;
+  return n;
+};
+
+// Thumbnails come from another origin, so the canvas taints unless the server
+// sends CORS headers. If it does not, this returns null and identification
+// carries on without it rather than failing.
+function hashOfUrl(url) {
+  return new Promise(res=>{
+    const img=new Image();
+    img.crossOrigin='anonymous';
+    const done=v=>{ img.onload=img.onerror=null; res(v); };
+    img.onload=()=>{
+      try {
+        const c=document.createElement('canvas');
+        c.width=img.naturalWidth; c.height=img.naturalHeight;
+        c.getContext('2d').drawImage(img,0,0);
+        done(dHash(c));
+      } catch(e) { done(null); }
+    };
+    img.onerror=()=>done(null);
+    setTimeout(()=>done(null), 6000);
+    img.src=url;
+  });
+}
+
+// Only worth calling when text has already narrowed things to a handful.
+async function pickByArt(hits, flat) {
+  const withThumbs=hits.filter(h=>h.thumb).slice(0,10);
+  if (withThumbs.length<2) return null;
+  const mine=dHash(flat.canvas);
+  const scored=[];
+  for (const h of withThumbs) {
+    const hash=await hashOfUrl(h.thumb);
+    if (hash) scored.push({ hit:h, d:hashDistance(mine,hash) });
+  }
+  if (scored.length<2) return null;
+  scored.sort((a,b)=>a.d-b.d);
+  const [best,next]=scored;
+  console.log('[art] '+scored.map(s=>`${s.hit.set} ${s.hit.number}:${s.d}`).join(' '));
+  // Close enough to be a real match, and clearly ahead of the runner-up. Two
+  // printings that share artwork will tie here, and a tie must not be resolved
+  // by guessing - it goes to review instead.
+  if (best.d<=14 && next.d-best.d>=5) return best;
+  return null;
+}
+
 async function tryQuery(q) {
   try { return (await apiGet(q,24)).map(mapCard); } catch(e) { return []; }
 }
@@ -2574,14 +2652,26 @@ async function autoIdentify(flat, note) {
   // that came from a guessed separator is fine to try - the database rejects the
   // wrong splits by returning nothing.
   const nms=nm?nameVariants(nm):[];
+  // The digits after the slash are the set's printed total, and they identify
+  // the set on their own - 167 is Twilight Masquerade whatever the number before
+  // the slash turned out to be. It is also the half of the pair most likely to
+  // survive: three digits read as a group, no leading zero to lose. So carry it
+  // as a filter on every route, not only the number-only ones.
+  const totals=[...new Set(cands.map(c=>c.total).filter(Boolean))];
+
   const routes=[];
   for (const c of cands) {
     const num=String(c.number);
     if (f.setCode) routes.push({ q:`set.ptcgoCode:${f.setCode} number:${num}`, via:`${f.setCode} ${num}`, min:45 });
-    for (const v of nms) routes.push({ q:`name:"*${v}*" number:${num}`, via:`${v} ${num}`, min:40, name:v });
+    for (const v of nms) routes.push({ q:`name:"*${v}*" number:${num}`, via:`${v} ${num}`, min:40, name:v, total:c.total });
   }
   for (const v of nms)
     if (f.setCode) routes.push({ q:`name:"*${v}*" set.ptcgoCode:${f.setCode}`, via:`${v} in ${f.setCode}`, min:40, name:v });
+  // Name plus set total, before name alone: it is the same query but with the
+  // set pinned down, which is usually the difference between one card and seven.
+  for (const v of nms)
+    for (const t of totals)
+      routes.push({ q:`name:"*${v}*"`, via:`${v} in a set of ${t}`, min:45, name:v, total:t });
   for (const v of nms)
     routes.push({ q:`name:"*${v}*"`, via:v, min:55, name:v });
   for (const c of cands)
@@ -2593,13 +2683,20 @@ async function autoIdentify(flat, note) {
                  +(f.number!=null?`only read a stray "${f.number}"`:'nothing legible on the card') };
 
   let widest=[];
+  const tried=new Set();
   for (const r of routes) {
+    // Several routes reduce to the same query once a total is only a filter.
+    const key=r.q+'|'+(r.total||'');
+    if (tried.has(key)) continue;
+    tried.add(key);
+
     let hits=await tryQuery(r.q);
-    // A printed total is a free filter: 79 exists in dozens of sets, but 79 in a
-    // set of 86 is nearly unique.
+    // A printed total is a free filter: 95 exists in dozens of sets, but 95 in a
+    // set of 167 is nearly unique.
     if (r.total) {
       const narrowed=hits.filter(h=>h.printedTotal===r.total);
-      if (narrowed.length) hits=narrowed;
+      if (!narrowed.length) continue;      // the total says this is the wrong set
+      hits=narrowed;
     }
     if (!hits.length) continue;
     // The database matched something, but a loose wildcard will match almost
@@ -2614,8 +2711,18 @@ async function autoIdentify(flat, note) {
     if (!widest.length || hits.length<widest.length) widest=hits;
   }
 
+  // Text has done all it can. If it left a short list, the artwork can often
+  // finish the job - and this is the one signal that does not depend on
+  // resolving small print.
+  if (widest.length>1 && widest.length<=10) {
+    const byArt=await pickByArt(widest, flat);
+    if (byArt)
+      return { confident:true, hit:byArt.hit, read, name:nm,
+               via:`artwork match (${byArt.d}/64 different)` };
+  }
+
   return { confident:false, read, name:nm, hits:widest,
-           why: widest.length ? `${widest.length} cards match ${nm||n}`
+           why: widest.length ? `${widest.length} cards match ${nm||n}, artwork could not separate them`
                               : `nothing matched ${nm||n||'that'}` };
 }
 
