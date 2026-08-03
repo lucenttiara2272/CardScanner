@@ -533,10 +533,12 @@ const MARKUP = String.raw`
 <div class="ownedView" id="review" style="display:none"></div>
 
 <footer>
-  The background reference for each edge is now found in two passes: a thin outer
-  strip locates the card roughly, then the true background is sampled from the gap
-  between the frame and the card. A margin of a few percent no longer poisons it &mdash;
-  though more margin still gives a cleaner reading.
+  Measures <b>centering only</b> &mdash; the width of the border on each side of the
+  printed frame &mdash; and reports the highest grade that centering alone would allow.
+  Corners and edges are magnified for you to judge; they are not scored. Surface,
+  print and authenticity are not examined at all, so a 10 here is a ceiling rather
+  than a prediction. Records are kept in this browser only: export from the
+  collection to keep them.
 </footer>
 `;
 document.body.innerHTML = MARKUP;
@@ -4343,7 +4345,25 @@ async function captureScan() {
 }
 
 // The captured canvas goes through exactly the same pipeline as a loaded file.
+// The scan screen has its own result panel and the flag bar is not on show here,
+// so this reports through the same channel as an ordinary "could not find the
+// card" rather than through guard(). Clearing `busy` matters most: without it the
+// capture button stays spinning and the camera never comes back.
 function runScanPipeline(canvas) {
+  try {
+    return runScanPipelineImpl(canvas);
+  } catch (err) {
+    console.error('[guard] measuring the capture', err);
+    state.scan.busy=false;
+    state.scan.result={ ok:false,
+      why:'Something went wrong measuring that capture: '
+        + ((err && err.message) ? err.message : String(err))
+        + '. Try another shot — details are in the browser console.' };
+    renderScan();
+  }
+}
+
+function runScanPipelineImpl(canvas) {
   const lb=stripLetterbox(canvas);
   state.letterbox=lb.cropped?lb.bars:null;
   canvas=lb.img;
@@ -4616,9 +4636,13 @@ document.getElementById('file').onchange = e => {
 };
 
 function openFile(file) {
-  {
   const img=new Image();
-  img.onload=()=>{
+  const url=URL.createObjectURL(file);
+  // The object URL is a live handle on the file; releasing it once the bitmap is
+  // decoded keeps a long batch from holding every photo it has ever opened.
+  const release=()=>{ try { URL.revokeObjectURL(url); } catch(e) {} };
+
+  img.onload=()=>guard('reading the photo', ()=>{
     const lb=stripLetterbox(img);
     state.letterbox=lb.cropped?lb.bars:null;
     state.img=lb.img; state.flat=null; state.guides=null;
@@ -4633,9 +4657,17 @@ function openFile(file) {
     };
     goStep(1);
     runDetect();
+    release();
+  }, release);
+
+  // A file the browser cannot decode used to do nothing at all - no card, no
+  // message, no clue that the click had registered.
+  img.onerror=()=>{
+    release();
+    setFlag('bad','That file could not be read as an image. If it came from a phone it may be in a format this browser does not decode — try exporting it as JPEG or PNG.');
   };
-  img.src=URL.createObjectURL(file);
-  }
+
+  img.src=url;
 }
 
 // Recomputed whenever the lines change, not just after detection, so a hand
@@ -4865,7 +4897,13 @@ function renderGuideNote() {
     : `<b>No inner border found</b> — the frame and artwork are too close in tone on every side. Place all four guides by hand.`;
 }
 
+// Guarded at the door rather than around each build below, so a failure in the
+// corner or edge analysis still reports instead of stopping the step half-drawn.
 function goStep(n) {
+  return guard('opening step '+n, ()=>goStepImpl(n));
+}
+
+function goStepImpl(n) {
   state.step=n; state.drag=null; state.pointer=null;
   if (n!==1) setPick(null);
   document.querySelectorAll('#rail div').forEach(d=>{
@@ -5011,10 +5049,15 @@ async function doStraighten() {
   if (!quad) { setFlag('bad','Two lines are parallel, so they never meet at a corner.'); return; }
   const btn=document.getElementById('go');
   btn.textContent='Straightening\u2026'; btn.disabled=true;
+  // However this ends, the button goes back to being pressable. It used to be
+  // left disabled and mid-sentence whenever anything below threw.
+  const restore=()=>{ btn.textContent='Straighten card'; btn.disabled=false; };
   await new Promise(r=>setTimeout(r,16));
 
+  await guardAsync('straightening the card', async()=>{
+
   const flat=straighten(state.img,quad);
-  if (!flat) { setFlag('bad','Could not build a correction from those lines.'); btn.textContent='Straighten card'; btn.disabled=false; return; }
+  if (!flat) { setFlag('bad','Could not build a correction from those lines.'); restore(); return; }
 
   state.flat=flat;
   state.quad=quad;
@@ -5040,13 +5083,74 @@ async function doStraighten() {
   else setFlag(null);
 
   goStep(2);
+  restore();
+
+  }, restore);
 }
 
 function setFlag(level,msg) {
   const el=document.getElementById('flag');
+  if (!el) return;
   if (!level) { el.dataset.show='0'; return; }
   el.dataset.show='1'; el.dataset.level=level; el.textContent=msg;
 }
+
+// ---- error boundary ---------------------------------------------------------
+//
+// The measurement pipeline is a long chain of arithmetic on pixel data, and an
+// unusual photo can put a NaN or an out-of-range index somewhere none of the
+// explicit checks look. Before this, such a throw simply stopped the call stack:
+// the interface was left mid-action - a button still reading "Straightening..."
+// and permanently disabled - with nothing on screen to say why.
+//
+// So every way into the pipeline runs through guard(). A failure becomes an
+// ordinary red flag, exactly like the ones raised deliberately, and whatever UI
+// the action had put into a pending state is handed back. Nothing here tries to
+// RECOVER - the reading is gone either way - it only makes the failure visible
+// and leaves the app in a state you can load another photo into.
+
+function crashMessage(doing, err) {
+  const detail = (err && err.message) ? err.message : String(err);
+  return `Something went wrong while ${doing}: ${detail}. `
+       + `This photo may be unusual in a way the measurement did not expect — `
+       + `try another, or reload the page. The full error is in the browser console.`;
+}
+
+// `doing` completes the sentence "went wrong while ___", so phrase it as an
+// activity: 'reading the photo', 'straightening the card'.
+function guard(doing, fn, cleanup) {
+  try {
+    return fn();
+  } catch (err) {
+    console.error('[guard] ' + doing, err);
+    if (cleanup) { try { cleanup(); } catch (e) { console.error('[guard] cleanup', e); } }
+    setFlag('bad', crashMessage(doing, err));
+    return undefined;
+  }
+}
+
+async function guardAsync(doing, fn, cleanup) {
+  try {
+    return await fn();
+  } catch (err) {
+    console.error('[guard] ' + doing, err);
+    if (cleanup) { try { cleanup(); } catch (e) { console.error('[guard] cleanup', e); } }
+    setFlag('bad', crashMessage(doing, err));
+    return undefined;
+  }
+}
+
+// Last line of defence. Anything thrown outside a guarded path - a stray event
+// handler, a rejected promise nobody awaited - still gets said out loud rather
+// than only appearing in a console the user is not looking at.
+window.addEventListener('error', e => {
+  console.error('[uncaught]', e.error || e.message);
+  setFlag('bad', crashMessage('running', e.error || e.message));
+});
+window.addEventListener('unhandledrejection', e => {
+  console.error('[unhandled rejection]', e.reason);
+  setFlag('bad', crashMessage('running', e.reason));
+});
 
 // ===========================================================================
 // EDGES
@@ -5940,6 +6044,10 @@ function renderConcerns() {
 }
 
 function measure() {
+  return guard('measuring the centring', measureImpl);
+}
+
+function measureImpl() {
   const f=state.flat,g=state.guides; if (!f||!g) return;
   const left=g.left,right=f.w-g.right,top=g.top,bottom=f.h-g.bottom;
   // Same evenness test the batch and scan apply: a card's frame is uniform, so
