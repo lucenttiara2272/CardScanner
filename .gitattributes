@@ -1,0 +1,16 @@
+# Normalize line endings: store LF in the repo, let git check out
+# whatever the platform prefers. Keeps diffs free of CRLF churn.
+* text=auto eol=lf
+
+# Binary assets - never touch these.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.pdf binary
