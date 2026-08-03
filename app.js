@@ -2040,6 +2040,7 @@ function quickPick(i) {
   const hit=r.hits[i];
   const w=ownedAdd(hit, r.thumb);
   if (!w.ok) { r.msg=w.error; renderScan(); return; }
+  if (r.art) { const bits=unpackHash(r.art); if (bits) rememberCard(hit, bits); }
   state.scan.lastAdded=`${hit.name} — ${hit.set} ${hit.number}`;
   quickNext();
 }
@@ -2599,7 +2600,8 @@ async function readCardName(flat) {
 // enormously better than one that does not run.
 // ===========================================================================
 
-const ART_DB='centeringGauge.cache', ART_STORE='artHashes', ART_DB_VER=1;
+const ART_DB='centeringGauge.cache', ART_STORE='artHashes', ART_DB_VER=2;
+const KNOWN_STORE='knownCards';
 const ART_CAP=20000;          // ~1 MB of hashes; far more cards than anyone scans
 const ART_OPEN_TIMEOUT=3000;  // never let storage hold up a measurement
 
@@ -2639,12 +2641,16 @@ function artDb() {
     let req;
     try { req=indexedDB.open(ART_DB, ART_DB_VER); }
     catch(e) { return done(null); }
+    // Each store is created only if absent, so upgrading from v1 adds the new
+    // one and leaves every hash already collected exactly where it is.
     req.onupgradeneeded=()=>{
       const db=req.result;
       if (!db.objectStoreNames.contains(ART_STORE)) {
         const os=db.createObjectStore(ART_STORE,{ keyPath:'url' });
         os.createIndex('seen','seen');   // for pruning oldest-first
       }
+      if (!db.objectStoreNames.contains(KNOWN_STORE))
+        db.createObjectStore(KNOWN_STORE,{ keyPath:'id' });
     };
     // Pruned here, on open, rather than on write: at this moment the store holds
     // everything carried over from previous sessions, which is the only time the
@@ -2720,6 +2726,102 @@ async function artHash(url) {
     if (db) artWrite(db,url,packHash(bits));
   }
   return bits;
+}
+
+// ===========================================================================
+// KNOWN CARDS
+//
+// Identification rested entirely on reading a collector number about 1.5mm
+// tall, freshly, on every single scan. Nothing was remembered. So the same card
+// could be identified on Monday and land in the review queue on Tuesday, purely
+// because the light moved - which is exactly what it did.
+//
+// Once a card HAS been identified, its artwork is a far better key than its
+// print: it is large, high contrast, and does not care about focus. So every
+// confirmed identification is recorded against a hash of the card, and a later
+// scan asks this table before it asks Tesseract anything.
+//
+// The check is deliberately timid. A wrong recall is worse than no recall -
+// it files a card as something it is not, silently - so a match must be both
+// close in absolute terms AND clearly better than the runner-up. Anything
+// ambiguous declines and lets the ordinary text route run.
+// ===========================================================================
+
+const RECALL_MAX_D    = 10;  // out of 64 bits; two photos of one card sit well under
+const RECALL_MARGIN   = 6;   // how far ahead of the runner-up the winner must be
+const RECALL_SOLO_D   = 8;   // stricter when there is no runner-up to compare against
+const KNOWN_HASHES    = 4;   // photos kept per card, to cover lighting differences
+
+let knownCache=null;   // whole table, held in memory; it is small and read often
+
+async function knownAll() {
+  if (knownCache) return knownCache;
+  const db=await artDb();
+  if (!db) return (knownCache=[]);
+  knownCache=await new Promise(resolve=>{
+    try {
+      const rq=db.transaction(KNOWN_STORE,'readonly').objectStore(KNOWN_STORE).getAll();
+      rq.onsuccess=()=>resolve(rq.result||[]);
+      rq.onerror=()=>resolve([]);
+    } catch(e) { resolve([]); }
+  });
+  return knownCache;
+}
+
+// Records a confirmed identification. Several hashes are kept per card because
+// one photograph is one lighting condition, and the second scan - the one this
+// exists to rescue - is usually taken under a different one.
+async function rememberCard(hit, bits) {
+  if (!hit || !hit.id || !bits) return;
+  const db=await artDb();
+  const packed=packHash(bits);
+  const rows=await knownAll();
+
+  let row=rows.find(r=>r.id===hit.id);
+  if (row) {
+    if (row.hashes.includes(packed)) return;
+    row.hashes=[packed, ...row.hashes].slice(0,KNOWN_HASHES);
+    row.seen=Date.now();
+  } else {
+    row={ id:hit.id, hashes:[packed], seen:Date.now(),
+          card:{ id:hit.id, name:hit.name, set:hit.set, number:hit.number,
+                 setCode:hit.setCode||null, printedTotal:hit.printedTotal||null,
+                 supertype:hit.supertype||null, subtypes:hit.subtypes||null,
+                 thumb:hit.thumb||null, prices:hit.prices||null } };
+    rows.push(row);
+  }
+  if (db) {
+    try { db.transaction(KNOWN_STORE,'readwrite').objectStore(KNOWN_STORE).put(row); }
+    catch(e) {}
+  }
+}
+
+// The lookup. Returns the remembered card, or null when it is not sure.
+async function recallByArt(flat) {
+  const rows=await knownAll();
+  if (!rows.length) return null;
+
+  const mine=dHash(flat.canvas);
+  const scored=[];
+  for (const r of rows) {
+    // A card may carry several hashes; it is judged on its closest one.
+    let best=64;
+    for (const h of r.hashes) {
+      const bits=unpackHash(h);
+      if (bits) best=Math.min(best, hashDistance(mine,bits));
+    }
+    scored.push({ row:r, d:best });
+  }
+  scored.sort((a,b)=>a.d-b.d);
+
+  const win=scored[0], next=scored[1];
+  const close = next ? (win.d<=RECALL_MAX_D && next.d-win.d>=RECALL_MARGIN)
+                     : (win.d<=RECALL_SOLO_D);
+  console.log(`[recall] ${rows.length} known · best ${win.row.card.name} ${win.d}/64`
+    + (next?` · next ${next.d}`:' · no runner-up')
+    + ` -> ${close?'match':'declined'}`);
+  if (!close) return null;
+  return { hit:win.row.card, d:win.d, hashBits:mine };
 }
 
 // dHash: compare each pixel with its right-hand neighbour on a 9x8 grid. It
@@ -2807,6 +2909,16 @@ async function tryQuery(q) {
 // needs actually survived OCR, and a route only settles the matter when it comes
 // back with exactly one card.
 async function autoIdentify(flat, note) {
+  // A card already identified once is settled by its artwork before any text is
+  // read. This is the fast path and the reliable one: no OCR, no network, and
+  // the same answer every time, which is the whole point - the number is what
+  // was making a second scan of one card disagree with the first.
+  const recalled=await recallByArt(flat);
+  if (recalled)
+    return { confident:true, hit:recalled.hit, recalled:true, hashBits:recalled.hashBits,
+             read:{ ok:true, conf:100, text:'', facts:null }, name:recalled.hit.name,
+             via:`artwork you scanned before (${recalled.d}/64 different)` };
+
   // The name band comes off the top of the card, so it survives the commonest
   // failure - an outline that runs past the bottom edge. Read it first and
   // always, rather than treating it as a fallback.
@@ -3007,14 +3119,23 @@ async function quickAuto(flat) {
   // Always try. A quad that overshoots the bottom edge ruins the number strip
   // but leaves the name band at the top untouched, so there is still a route to
   // the card - and refusing to look was throwing that away.
+  // Hashed once, here, and carried from this point on: the rectified card is
+  // not kept, so a review item that gets named by hand tomorrow would otherwise
+  // have nothing left to remember the artwork by.
+  const artBits=dHash(flat.canvas);
+
   const res=await autoIdentify(flat, sc.result.fault);
   if (!sc.result) return;                       // moved on while we were working
 
   if (res.confident) {
     const w=ownedAdd(res.hit, sc.result.thumb);
     if (w.ok) {
+      rememberCard(res.hit, artBits);
+      // How it was identified, not just what: a recall that gets it wrong is
+      // silent otherwise, and this is the line that makes it catchable.
       sc.lastAdded=`${res.hit.name} — ${res.hit.set} ${res.hit.number}`
-        + (res.via?` (read ${res.via})`:'');
+        + (res.recalled ? ' (matched artwork you scanned before)'
+           : res.via ? ` (read ${res.via})` : '');
       sc.lastReview=null;
       sc.autoStats.added++;
       quickNext();
@@ -3026,6 +3147,7 @@ async function quickAuto(flat) {
   const f=(res.read&&res.read.facts)||{};
   const r=reviewAdd({
     thumb:sc.result.thumb, strip:sc.result.reviewStrip,
+    art:packHash(artBits),
     ocr:res.read?res.read.text:'', conf:res.read?Math.round(res.read.conf||0):0,
     setCode:f.setCode||null, number:f.number!=null?f.number:null, total:f.total||null,
     trust:f.trust||'none', name:res.name||null,
@@ -3089,6 +3211,9 @@ function renderReview() {
       const hit=rv.hits[+b.dataset.i];
       const w=ownedAdd(hit, it.thumb);
       if (!w.ok) { state.review.msg=w.error; renderReview(); return; }
+      // Named by hand, so this is the most reliable identification the app will
+      // ever get for this card. Worth remembering above all the others.
+      if (it.art) { const bits=unpackHash(it.art); if (bits) rememberCard(hit, bits); }
       reviewRemove(it.id);
       state.review={open:null};
       renderReview();
@@ -4553,6 +4678,7 @@ function runScanPipelineImpl(canvas) {
       ok:true, quick:true, fault:bad,   // advisory only - never blocks a read
       thumb:makeThumb(flat,150), numStrip:makeNumberStrip(flat),
       reviewStrip:makeReviewStrip(flat,600),
+      art:packHash(dHash(flat.canvas)),
       hits:null, query:'', searching:false, msg:null,
       autoBusy:false, autoMsg:null
     };
