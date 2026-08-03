@@ -2313,13 +2313,20 @@ function findSetCode(t, codes) {
 // card database decide which one is a real card - the same trick that keeps the
 // set codes honest.
 function numberCandidates(t) {
-  const seen=new Set(), out=[];
+  const seen=new Set(), out=[], totals=new Set();
   const push=(a,b,trust)=>{
     // parseInt drops the leading zero, which is what the database wants anyway:
     // the card printed as 095/167 is number 95 in the API.
     const n=parseInt(a,10), tot=b!=null?parseInt(b,10):null;
+    const totOk = tot!=null && tot>=1 && tot<=999;
+    // A printed total that came through is worth keeping even when the number
+    // beside it did not. It names the set on its own, which is the strongest
+    // filter there is. Rejecting the whole pair threw that away: "00/088" is a
+    // read where the number is lost and the set is perfectly clear, and it was
+    // being discarded outright.
+    if (totOk) totals.add(tot);
     if (!(n>=1 && n<=999)) return;
-    if (tot!=null && !(tot>=1 && tot<=999)) return;
+    if (tot!=null && !totOk) return;
     const key=n+'/'+tot;
     if (seen.has(key)) return;
     seen.add(key);
@@ -2347,17 +2354,29 @@ function numberCandidates(t) {
     const solo=t.match(/\b(\d{1,3})\b/);
     if (solo) push(solo[1], null, 'weak');
   }
-  return out;
+  // A lone group equal to a total already seen is that total read a second time,
+  // not the card's number. Reporting it as the number is how "008/088" came back
+  // as "a stray 88". A genuine 88/88 still survives: it carries its own total, so
+  // it is not bare.
+  const list=totals.size ? out.filter(c=>!(c.total==null && totals.has(c.number))) : out;
+  return { list, totals:[...totals] };
 }
 
 function parseStripText(text, codes) {
   const t=(text||'').toUpperCase().replace(/[|]/g,'I');
   const out={ number:null, total:null, setCode:null, regMark:null, trust:'none', candidates:[] };
 
-  out.candidates=numberCandidates(t);
+  const nc=numberCandidates(t);
+  out.candidates=nc.list;
+  // Totals read anywhere in the strip, whether or not a number survived beside
+  // them. Carried separately so a card with an unreadable number can still be
+  // pinned to its set.
+  out.setTotals=nc.totals;
   if (out.candidates.length) {
     const c=out.candidates[0];
     out.number=c.number; out.total=c.total; out.trust=c.trust;
+  } else if (nc.totals.length===1) {
+    out.total=nc.totals[0];
   }
 
   out.setCode=findSetCode(t, codes);
@@ -2440,7 +2459,28 @@ function bandCanvas(flat, mmTop, mmBottom, x0, x1, targetPx) {
 //   - the set code and collector number sit on the last printed line, roughly
 //     82mm down, in the left half - the illustrator credit is the line above and
 //     the rules text is to the right, and both were being fed in as noise
-const numberCanvas = flat => bandCanvas(flat, 81.5, 87.5, 0.02, 0.52, 190);
+// Narrow windows across the bottom of the card, measured up from its bottom
+// edge so they hold for any card size. The single 6mm band this replaces swept
+// up the illustrator credit, the regulation mark and the copyright line along
+// with the number, then handed Tesseract three different lines of type as if
+// they were one paragraph - which is how a perfectly legible "008/088" came back
+// as "DOF PI GT00/088 02046POO/N/" at 9% confidence. The windows overlap, so a
+// line sitting across one boundary is still whole inside its neighbour.
+const NUMBER_SPANS = [[7.0,4.5],[5.7,3.2],[4.5,2.0],[6.5,0.5]];
+const numberCanvas = flat => bandCanvas(flat, CARD_MM.h-6.5, CARD_MM.h-0.5, 0.02, 0.52, 190);
+const numberBands  = flat =>
+  NUMBER_SPANS.map(([a,b])=>bandCanvas(flat, CARD_MM.h-a, CARD_MM.h-b, 0.02, 0.52, 190));
+
+// How much a parse is worth, so the best of several bands can be chosen. A clean
+// pair beats a split, a split beats a lone total, and confidence only breaks ties.
+const FACTS_CLEAN = 100;
+function factScore(f, conf) {
+  const t=f.candidates.length ? f.candidates[0].trust : null;
+  let s = t==='strong' ? FACTS_CLEAN : t==='split' ? 60 : t==='weak' ? 20 : 0;
+  if (f.setTotals && f.setTotals.length) s=Math.max(s,30);
+  if (f.setCode) s+=20;
+  return s + Math.min(conf||0,100)/1000;
+}
 const nameCanvas   = flat => bandCanvas(flat,  4.0, 13.5, 0.04, 0.76, 210);
 
 // Two bands, two alphabets. The bottom line is digits, a slash and the capitals
@@ -2472,20 +2512,31 @@ async function readCardFacts(flat) {
   console.log(`[ocr] reading a card rectified at ${pxmm.toFixed(1)} px/mm`
     + (pxmm<22?' — too low for the collector number, expect the name to carry it':''));
   try {
-    const c=numberCanvas(flat);
-    let pass=await ocrPass(c,'6',OCR_ALPHABET.number);
-    let f=parseStripText(pass.text, codes);
-    // Block mode assumes tidy lines. When it finds nothing, sparse mode often
-    // picks the number out of a crop the layout analyser gave up on.
-    // A second pass costs as much as the first, so it only runs when the first
-    // came back with nothing usable at all - not merely something imperfect.
-    if (!f.candidates.length && !f.setCode) {
-      const alt=await ocrPass(c,'11',OCR_ALPHABET.number);
-      const af=parseStripText(alt.text, codes);
-      if (af.candidates.length || af.setCode) { pass=alt; f=af; }
+    // Each window in turn, keeping the best reading. Most cards are settled by
+    // the first or second, and a clean pair stops the search immediately, so the
+    // extra windows are only paid for on the cards that were failing anyway.
+    const bands=numberBands(flat);
+    let best=null;
+    for (let i=0;i<bands.length;i++) {
+      const p=await ocrPass(bands[i],'6',OCR_ALPHABET.number);
+      const f=parseStripText(p.text, codes);
+      const s=factScore(f,p.conf);
+      console.log(`[ocr] band ${i} "${p.text.replace(/\n/g,' | ')}" conf=${Math.round(p.conf)} score=${s.toFixed(1)}`);
+      if (!best || s>best.score) best={ pass:p, facts:f, score:s, band:i };
+      if (s>=FACTS_CLEAN) break;
     }
-    console.log(`[ocr] number band "${pass.text.replace(/\n/g,' | ')}" conf=${Math.round(pass.conf)} `
-      + `-> set=${f.setCode||'--'} candidates=`
+
+    // Block mode assumes tidy lines. When every window still comes back with
+    // nothing usable, sparse mode often picks the number out of a crop the
+    // layout analyser gave up on.
+    if (best.score<20) {
+      const alt=await ocrPass(numberCanvas(flat),'11',OCR_ALPHABET.number);
+      const af=parseStripText(alt.text, codes);
+      if (factScore(af,alt.conf)>best.score) best={ pass:alt, facts:af, score:factScore(af,alt.conf), band:'sparse' };
+    }
+
+    const pass=best.pass, f=best.facts;
+    console.log(`[ocr] chose band ${best.band} -> set=${f.setCode||'--'} totals=${(f.setTotals||[]).join(',')||'--'} candidates=`
       + (f.candidates.length?f.candidates.map(c=>`${c.number}${c.total?'/'+c.total:''}(${c.trust})`).join(' '):'none'));
     return { ok:true, text:pass.text, conf:pass.conf, facts:f };
   } catch(e) {
@@ -2747,6 +2798,8 @@ async function artHash(url) {
 // ambiguous declines and lets the ordinary text route run.
 // ===========================================================================
 
+const ART_BATCH       = 12;  // thumbnails fetched at once when hashing a set
+const SET_RESCUE_MAX  = 250; // largest set worth sifting by artwork alone
 const RECALL_MAX_D    = 10;  // out of 64 bits; two photos of one card sit well under
 const RECALL_MARGIN   = 6;   // how far ahead of the runner-up the winner must be
 const RECALL_SOLO_D   = 8;   // stricter when there is no runner-up to compare against
@@ -2872,8 +2925,8 @@ function hashOfUrl(url) {
 }
 
 // Only worth calling when text has already narrowed things to a handful.
-async function pickByArt(hits, flat) {
-  const withThumbs=hits.filter(h=>h.thumb).slice(0,10);
+async function pickByArt(hits, flat, cap) {
+  const withThumbs=hits.filter(h=>h.thumb).slice(0, cap||10);
   if (withThumbs.length<2) return null;
   const mine=dHash(flat.canvas);
 
@@ -2883,7 +2936,12 @@ async function pickByArt(hits, flat) {
   // turn made the worst case a minute of nothing happening.
   const t0=performance.now();
   const cached=withThumbs.filter(h=>artMem.has(h.thumb)).length;
-  const hashes=await Promise.all(withThumbs.map(h=>artHash(h.thumb)));
+  // In batches rather than all at once: a whole set can be a couple of hundred
+  // cards, and asking a phone for that many images simultaneously is a good way
+  // to have most of them time out.
+  const hashes=[];
+  for (let i=0;i<withThumbs.length;i+=ART_BATCH)
+    hashes.push(...await Promise.all(withThumbs.slice(i,i+ART_BATCH).map(h=>artHash(h.thumb))));
 
   const scored=[];
   for (let i=0;i<withThumbs.length;i++)
@@ -3005,8 +3063,30 @@ async function autoIdentify(flat, note) {
   if (widest.length>1 && widest.length<=10) {
     const byArt=await pickByArt(widest, flat);
     if (byArt)
-      return { confident:true, hit:byArt.hit, read, name:nm,
+      return { confident:true, hit:byArt.hit, read, name:nm, hashBits:dHash(flat.canvas),
                via:`artwork match (${byArt.d}/64 different)` };
+  }
+
+  // Last resort. The number is gone but the printed total came through, and a
+  // total names the set on its own - "of 88" is one set, whatever the digits in
+  // front of the slash turned out to be. A set is small enough for the artwork
+  // to finish the job, which is the whole reason the total is now kept when its
+  // number is discarded. Costly on the first card of a set, because it hashes
+  // that set's thumbnails; nearly free on every card after, because they stay
+  // hashed.
+  const rescue=(f.setTotals||[]).filter(Boolean);
+  if (rescue.length===1) {
+    const t=rescue[0];
+    let pool=[];
+    try { pool=(await apiGet(`set.printedTotal:${t}`, SET_RESCUE_MAX)).map(mapCard); } catch(e) {}
+    pool=pool.filter(h=>h.printedTotal===t);
+    console.log(`[rescue] number unreadable, set of ${t} -> ${pool.length} cards to compare by artwork`);
+    if (pool.length>1 && pool.length<=SET_RESCUE_MAX) {
+      const byArt=await pickByArt(pool, flat, SET_RESCUE_MAX);
+      if (byArt)
+        return { confident:true, hit:byArt.hit, read, name:nm, hashBits:dHash(flat.canvas),
+                 via:`artwork within the set of ${t} (${byArt.d}/64 different)` };
+    }
   }
 
   return { confident:false, read, name:nm, hits:widest,
