@@ -5047,17 +5047,20 @@ function goStepImpl(n) {
 async function doStraighten() {
   const quad=cornersFromEdges(state.edges);
   if (!quad) { setFlag('bad','Two lines are parallel, so they never meet at a corner.'); return; }
+
   const btn=document.getElementById('go');
   btn.textContent='Straightening\u2026'; btn.disabled=true;
-  // However this ends, the button goes back to being pressable. It used to be
+  // Yield once so the label actually paints before the resample blocks the
+  // thread, then put the button back however the work turns out. It used to be
   // left disabled and mid-sentence whenever anything below threw.
-  const restore=()=>{ btn.textContent='Straighten card'; btn.disabled=false; };
   await new Promise(r=>setTimeout(r,16));
+  guard('straightening the card', ()=>straightenImpl(quad));
+  btn.textContent='Straighten card'; btn.disabled=false;
+}
 
-  await guardAsync('straightening the card', async()=>{
-
+function straightenImpl(quad) {
   const flat=straighten(state.img,quad);
-  if (!flat) { setFlag('bad','Could not build a correction from those lines.'); restore(); return; }
+  if (!flat) { setFlag('bad','Could not build a correction from those lines.'); return; }
 
   state.flat=flat;
   state.quad=quad;
@@ -5083,9 +5086,6 @@ async function doStraighten() {
   else setFlag(null);
 
   goStep(2);
-  restore();
-
-  }, restore);
 }
 
 function setFlag(level,msg) {
@@ -5121,17 +5121,6 @@ function crashMessage(doing, err) {
 function guard(doing, fn, cleanup) {
   try {
     return fn();
-  } catch (err) {
-    console.error('[guard] ' + doing, err);
-    if (cleanup) { try { cleanup(); } catch (e) { console.error('[guard] cleanup', e); } }
-    setFlag('bad', crashMessage(doing, err));
-    return undefined;
-  }
-}
-
-async function guardAsync(doing, fn, cleanup) {
-  try {
-    return await fn();
   } catch (err) {
     console.error('[guard] ' + doing, err);
     if (cleanup) { try { cleanup(); } catch (e) { console.error('[guard] cleanup', e); } }
