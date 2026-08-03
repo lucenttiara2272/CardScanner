@@ -520,7 +520,6 @@ const MARKUP = String.raw`
     <div class="verdict"><b id="ceiling">—</b><span id="ceilingNote">No measurement yet.</span></div>
     <div class="concerns" id="concerns"></div>
     <div class="gaps" id="gaps"></div>
-    <div class="concerns" id="concerns"></div>
   </div>
 </div>
 
