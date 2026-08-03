@@ -2578,6 +2578,150 @@ async function readCardName(flat) {
 // single character.
 // ---------------------------------------------------------------------------
 
+// ===========================================================================
+// ART HASH CACHE
+//
+// Identifying an ambiguous card means comparing its artwork against every
+// candidate the database returned, and each comparison needs that candidate's
+// thumbnail hashed. Downloading a picture to produce 64 bits is expensive, and
+// it was being paid again on every single scan.
+//
+// A card's artwork never changes, so the hash for a given image URL is a
+// permanent fact. It is worth keeping, and it is small - 16 characters - which
+// is the whole reason this is worth doing: tens of thousands of them still cost
+// under a megabyte.
+//
+// They live in IndexedDB rather than localStorage deliberately. localStorage is
+// already carrying the collection, thumbnails and all, against a limit of a few
+// megabytes; spending that budget on a cache would push out the records the
+// cache exists to serve. Everything here degrades to a plain in-memory Map if
+// IndexedDB is missing or refuses to open, because a scan that works slowly is
+// enormously better than one that does not run.
+// ===========================================================================
+
+const ART_DB='centeringGauge.cache', ART_STORE='artHashes', ART_DB_VER=1;
+const ART_CAP=20000;          // ~1 MB of hashes; far more cards than anyone scans
+const ART_OPEN_TIMEOUT=3000;  // never let storage hold up a measurement
+
+// 64 bits as 16 hex characters. Stored packed because the unpacked form is an
+// array of 64 numbers, and structured-clone writes that out far larger than the
+// thing it represents.
+function packHash(bits) {
+  let s='';
+  for (let i=0;i<bits.length;i+=4)
+    s+=((bits[i]<<3)|(bits[i+1]<<2)|(bits[i+2]<<1)|bits[i+3]).toString(16);
+  return s;
+}
+
+function unpackHash(hex) {
+  const bits=[];
+  for (let i=0;i<hex.length;i++) {
+    const v=parseInt(hex[i],16);
+    if (Number.isNaN(v)) return null;
+    bits.push((v>>3)&1,(v>>2)&1,(v>>1)&1,v&1);
+  }
+  return bits;
+}
+
+// Also the fallback store when IndexedDB is unavailable, which is why lookups
+// consult it first rather than treating it as a mere optimisation.
+const artMem=new Map();
+
+let artDbPromise=null;
+function artDb() {
+  if (artDbPromise) return artDbPromise;
+  artDbPromise=new Promise(resolve=>{
+    let settled=false;
+    const done=v=>{ if (!settled) { settled=true; resolve(v); } };
+    // A blocked or hanging open must not strand the caller. Resolving null just
+    // means every lookup is a miss and the app behaves as it did before.
+    setTimeout(()=>done(null), ART_OPEN_TIMEOUT);
+    let req;
+    try { req=indexedDB.open(ART_DB, ART_DB_VER); }
+    catch(e) { return done(null); }
+    req.onupgradeneeded=()=>{
+      const db=req.result;
+      if (!db.objectStoreNames.contains(ART_STORE)) {
+        const os=db.createObjectStore(ART_STORE,{ keyPath:'url' });
+        os.createIndex('seen','seen');   // for pruning oldest-first
+      }
+    };
+    // Pruned here, on open, rather than on write: at this moment the store holds
+    // everything carried over from previous sessions, which is the only time the
+    // cap can actually be exceeded. Checking after a write instead meant checking
+    // when the store was at its smallest, so it never fired.
+    req.onsuccess=()=>{ done(req.result); artPrune(req.result); };
+    req.onerror=()=>done(null);
+    req.onblocked=()=>done(null);
+  });
+  return artDbPromise;
+}
+
+function artRead(db,url) {
+  return new Promise(resolve=>{
+    try {
+      const rq=db.transaction(ART_STORE,'readonly').objectStore(ART_STORE).get(url);
+      rq.onsuccess=()=>resolve(rq.result?rq.result.hash:null);
+      rq.onerror=()=>resolve(null);
+    } catch(e) { resolve(null); }
+  });
+}
+
+// Fire and forget: a failed write costs a re-download later and nothing else, so
+// nothing waits on it.
+function artWrite(db,url,hash) {
+  try {
+    db.transaction(ART_STORE,'readwrite').objectStore(ART_STORE)
+      .put({ url, hash, seen:Date.now() });
+  } catch(e) {}
+}
+
+// Drops the least recently used entries once the store grows past the cap. Runs
+// at most once per session and never blocks a lookup.
+let artPruned=false;
+function artPrune(db) {
+  if (artPruned) return;
+  artPruned=true;
+  try {
+    const os=db.transaction(ART_STORE,'readwrite').objectStore(ART_STORE);
+    const count=os.count();
+    count.onsuccess=()=>{
+      const over=count.result-ART_CAP;
+      if (over<=0) return;
+      let removed=0;
+      const cur=os.index('seen').openCursor();
+      cur.onsuccess=()=>{
+        const c=cur.result;
+        if (!c || removed>=over) return;
+        c.delete(); removed++; c.continue();
+      };
+    };
+  } catch(e) {}
+}
+
+// The one entry point: the hash for a thumbnail, from memory, from storage, or
+// from the network in that order.
+async function artHash(url) {
+  if (!url) return null;
+  if (artMem.has(url)) return artMem.get(url);
+
+  const db=await artDb();
+  if (db) {
+    const stored=await artRead(db,url);
+    if (stored) {
+      const bits=unpackHash(stored);
+      if (bits) { artMem.set(url,bits); return bits; }
+    }
+  }
+
+  const bits=await hashOfUrl(url);
+  if (bits) {
+    artMem.set(url,bits);
+    if (db) artWrite(db,url,packHash(bits));
+  }
+  return bits;
+}
+
 // dHash: compare each pixel with its right-hand neighbour on a 9x8 grid. It
 // describes gradients rather than absolute values, so it survives the exposure
 // and colour differences between a phone photo and a catalogue scan.
@@ -2630,15 +2774,24 @@ async function pickByArt(hits, flat) {
   const withThumbs=hits.filter(h=>h.thumb).slice(0,10);
   if (withThumbs.length<2) return null;
   const mine=dHash(flat.canvas);
+
+  // Cached hashes come back without touching the network at all. The ones that
+  // do not are fetched together rather than one after another: these are ten
+  // independent downloads with a six second timeout each, so waiting for them in
+  // turn made the worst case a minute of nothing happening.
+  const t0=performance.now();
+  const cached=withThumbs.filter(h=>artMem.has(h.thumb)).length;
+  const hashes=await Promise.all(withThumbs.map(h=>artHash(h.thumb)));
+
   const scored=[];
-  for (const h of withThumbs) {
-    const hash=await hashOfUrl(h.thumb);
-    if (hash) scored.push({ hit:h, d:hashDistance(mine,hash) });
-  }
+  for (let i=0;i<withThumbs.length;i++)
+    if (hashes[i]) scored.push({ hit:withThumbs[i], d:hashDistance(mine,hashes[i]) });
+
   if (scored.length<2) return null;
   scored.sort((a,b)=>a.d-b.d);
   const [best,next]=scored;
-  console.log('[art] '+scored.map(s=>`${s.hit.set} ${s.hit.number}:${s.d}`).join(' '));
+  console.log(`[art] ${scored.map(s=>`${s.hit.set} ${s.hit.number}:${s.d}`).join(' ')}`
+    + ` (${cached}/${withThumbs.length} in memory, ${Math.round(performance.now()-t0)}ms)`);
   // Close enough to be a real match, and clearly ahead of the runner-up. Two
   // printings that share artwork will tie here, and a tie must not be resolved
   // by guessing - it goes to review instead.
